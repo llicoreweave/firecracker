@@ -69,11 +69,16 @@ does not establish successful GPU peer DMA.
 
 ## Kata integration
 
-The accompanying Kata checkout enables this configuration only with explicit
-`enable_numa`, `numa_mapping` and `cold_plug_vfio = "switch-port"` settings.
-It divides guest CPU/RAM evenly among configured domains, reads device ancestry
-and locality from sysfs, and uses the host NUMA distance matrix. The guest agent
-parses the selected `pciDDDD:BB` root when resolving device paths.
+The accompanying Kata checkout enables this configuration with `enable_numa`
+and `cold_plug_vfio = "switch-port"`. An optional `numa_mapping` fixes domain
+order; otherwise its runtime planner selects permitted host domains from the
+allocated devices and CPU capacity. The planner reads device ancestry and
+locality from sysfs, respects effective and pod CPU/memory-node constraints,
+apportions guest CPU/RAM, and uses the host NUMA distance matrix. It writes the
+static configuration before starting the VMM and keeps the guest agent's PCI
+paths and NUMA translation synchronized with it. The guest agent parses the
+selected `pciDDDD:BB` root when resolving device paths. See the Kata checkout's
+`docs/how-to/firecracker-numa-pci.md` for configuration and resource semantics.
 
 ## Limits
 

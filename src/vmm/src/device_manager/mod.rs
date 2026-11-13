@@ -296,12 +296,13 @@ impl DeviceManager {
     /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
     pub(crate) fn configure_static_topology(
         &mut self,
+        topology: &crate::vmm_config::pci_topology::PciTopologyConfig,
         configs: &[crate::vmm_config::vfio::VfioDeviceConfig],
     ) -> Result<(), AttachDeviceError> {
         let VirtioDevices::Pci(pci) = &mut self.virtio_devices else {
             return Err(AttachDeviceError::PciNotEnabled);
         };
-        pci.configure_static_topology(configs)?;
+        pci.configure_static_topology(topology, configs)?;
         Ok(())
     }
 

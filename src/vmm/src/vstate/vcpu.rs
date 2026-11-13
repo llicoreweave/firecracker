@@ -756,7 +756,6 @@ pub(crate) mod tests {
                     vcpus: vec![0],
                     host_cpus: vec![host],
                     memory_mib: 2,
-                    pci_root_slots: vec![],
                 }],
                 distances: vec![vec![10]],
             };

@@ -5,61 +5,75 @@ This implementation extends the GPU-capable VFIO branch at
 configuration API. It is a local implementation of HAVOCK-2250, building on
 the October 21 topology and DMA-BUF prototype.
 
-Start Firecracker with `--enable-pci --config-file <file>`. Add an explicit
-`numa` object and a `pci_path` for each assigned function:
+Start Firecracker with `--enable-pci --config-file <file>`. The caller owns
+all topology policy. Firecracker consumes explicit guest PCI roots, bridges,
+port types, bus registers, endpoint BDFs and root NUMA affinity. It never reads
+host PCI ancestry or locality to choose any of these settings.
 
 ```json
 {
-  "machine-config": {
-    "vcpu_count": 2,
-    "mem_size_mib": 2048,
-    "huge_pages": "Transparent"
-  },
+  "machine-config": {"vcpu_count": 2, "mem_size_mib": 2048},
   "numa": {
     "nodes": [
-      {"host_node": 0, "vcpus": [0], "host_cpus": [0], "memory_mib": 1024, "pci_root_slots": [13]},
-      {"host_node": 1, "vcpus": [1], "host_cpus": [1], "memory_mib": 1024, "pci_root_slots": [14]}
+      {"host_node": 0, "vcpus": [0], "host_cpus": [0], "memory_mib": 1024},
+      {"host_node": 1, "vcpus": [1], "host_cpus": [1], "memory_mib": 1024}
     ],
     "distances": [[10, 21], [21, 10]]
   },
+  "pci-topology": {
+    "roots": [
+      {"bus": 0, "last_bus": 9, "numa_node": 0},
+      {"bus": 20, "last_bus": 29, "numa_node": 1}
+    ],
+    "bridges": [
+      {"pci_address": {"bus": 0, "device": 13, "function": 0}, "secondary_bus": 7, "subordinate_bus": 7, "type": "root-port"},
+      {"pci_address": {"bus": 20, "device": 13, "function": 0}, "secondary_bus": 25, "subordinate_bus": 25, "type": "root-port"}
+    ]
+  },
   "vfio": [
-    {"id": "gpu0", "path": "/sys/bus/pci/devices/0000:19:00.0", "pci_path": [13, 0]},
-    {"id": "gpu1", "path": "/sys/bus/pci/devices/0000:83:00.0", "pci_path": [14, 0]}
+    {"id": "gpu0", "path": "/sys/bus/pci/devices/0000:19:00.0", "pci_address": {"bus": 7, "device": 0, "function": 0}},
+    {"id": "gpu1", "path": "/sys/bus/pci/devices/0000:83:00.0", "pci_address": {"bus": 25, "device": 0, "function": 0}}
   ]
 }
 ```
 
 Merge this fragment with the VM's boot source, drives and other configuration.
-Host CPU IDs, PCI addresses and distances must match the actual host. Devices
-must already be allocated to the workload and bound to `vfio-pci`.
+The generator must supply actual host CPU IDs and distances and allocate devices
+exclusively, already bound to `vfio-pci`. Guest bus numbers can differ from host
+BDFs. In this example the guest endpoints are `0000:07:00.0` and `0000:19:00.0`.
+Sparse bus ranges and multiple PCI roots with the same NUMA affinity are allowed;
+reordering roots or changing affinity never renumbers any device.
 
-For jailed VMs, pass `--numa-node <host-id>` to the jailer for each configured
-host node, alongside the existing `--vfio-device` arguments. Kata emits these
-arguments automatically. The jailer copies only the requested CPU membership
-and assigned devices' `numa_node` values; host sysfs remains outside the jail.
+`roots[].numa_node` is the guest domain index in `numa.nodes`, not `host_node`.
+The VMM emits it directly as the ACPI PCI root's `_PXM`. When omitted, that root
+has no `_PXM`. Root identity and `_BBN` come from its configured bus number.
+ACPI SRAT/SLIT describe the independently configured CPU/memory domains. Linux
+derives subordinate endpoint locality through its PCI root bridge; a root-port
+`_PXM` alone does not establish endpoint locality on x86 Linux.
 
-Guest domains are numbered by `nodes` order. The VMM emits ACPI SRAT/SLIT and
-one ACPI PCI host bridge per domain, with `_PXM`, `_BBN` and disjoint `_CRS`
-resources. Linux consequently assigns endpoint locality through its PCI root
-bridge, including devices below multiple switch buses. Root-port `_PXM` alone
-does not establish endpoint locality on x86 Linux.
+Every bridge explicitly supplies its guest address (including primary bus),
+secondary bus, subordinate bus and PCIe port type. No missing bridge or endpoint
+address is generated. Invalid addresses, duplicate BDFs, cycles, disconnected
+buses, overlapping roots/windows, out-of-range domains and exhausted ECAM ranges
+fail validation before VFIO devices are opened. The old `pci_path` and
+`pci_root_slots` fields are no longer accepted. A flat VFIO configuration also
+supplies an explicit root and endpoint addresses, with `bridges: []`.
 
-`pci_path` lists bridge slots followed by an endpoint slot. For example,
-`[13,0,1,0]` creates a root port, upstream port, downstream port and endpoint.
-The VMM assigns buses deterministically by domain and lexicographic bridge
-prefix. Each additional domain consumes a root bus, including empty domains.
-CF8/CFC and ECAM accesses both decode secondary buses. The example above gives
-roots 00 and 02, with endpoints 01:00.0 and 03:00.0 in guest segment 0000.
+The VMM still probes device BAR requirements and allocates MMIO resources within
+the configured graph, including disjoint ACPI root windows and 1-MiB bridge
+window granularity. This resource allocation does not choose PCI connections,
+bus numbers, port types or locality. The x86 MMIO64 aperture spans 2 TiB starting
+at 2 TiB; exhaustion fails startup. CF8/CFC and ECAM both decode secondary buses.
 
-BAR placement reserves separate windows for sibling subtrees, respects 1-MiB
-bridge window granularity, packs naturally aligned BARs, and allocates domains
-consecutively. The x86 MMIO64 aperture spans 2 TiB starting at 2 TiB. Exhaustion
-fails VM startup. Original host BDF numbering is not reproduced.
+For jailed VMs, pass `--numa-node <host-id>` for each configured host node,
+alongside assigned `--vfio-device` arguments. Kata emits these automatically.
+The jailer supplies only selected CPU membership for CPU-affinity validation;
+it no longer copies device `numa_node` files. Host sysfs stays outside the jail.
 
 RAM ranges split at NUMA boundaries without counting PCI holes as RAM. Each
 mapping receives `MPOL_BIND` before first touch and VFIO pinning. Each vCPU
 thread pins to its corresponding host CPU before entering KVM. CPU locality,
-effective affinity, device locality, RAM totals, and PCI root coverage are
+effective affinity, RAM totals, and the explicit PCI graph are
 validated. Host CPU pinning does not reserve those CPUs exclusively.
 
 The static passthrough mode also retains IOMMUFD/VFIO DMA-BUF BAR export/import
@@ -83,14 +97,20 @@ selected `pciDDDD:BB` root when resolving device paths. See the Kata checkout's
 ## Limits
 
 - x86_64 cold boot; up to 64 vCPUs, 64 guest buses and host node IDs below 64.
-- Guest PCI functions use function zero. Paths have 2–8 slots; root slot zero
-  is reserved for the host bridge.
+- Guest PCI functions use function zero. At most seven bridge ancestors are
+  supported per endpoint; slot zero on bus zero is reserved for the host bridge.
 - No bridge bus renumbering, BAR relocation, device hotplug, memory hotplug,
   ballooning or NUMA snapshots. Unsupported combinations fail validation.
 - Kata's existing PCI path prefix type limits root bus prefixes to 00–1f;
   an unrepresentable root fails configuration before starting the VM.
-- Existing flat VFIO configurations can omit both `numa` and `pci_path`.
+- Existing configurations that used inferred VFIO addresses must be regenerated
+  with explicit `pci-topology` and `vfio[].pci_address`.
 
 All build dependencies and tests run in Linux containers. The hardware-only
 `numa::tests::test_numa_host_memory_binding` test explicitly verifies both
 memory policy and resident pages on a two-node host.
+
+The shared wire fixture `docs/fixtures/kata-pci-topology.json` is generated by
+Kata and consumed by the VMM's Rust tests. Sparse numbering, reordered bridge
+entries, shared root affinity, malformed graphs and BAR containment are covered
+separately from host hardware checks.

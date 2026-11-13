@@ -54,7 +54,6 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::MachineConfigError;
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
-use crate::vmm_config::vfio::VfioDeviceConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 #[cfg(target_arch = "aarch64")]
@@ -263,7 +262,7 @@ pub fn build_microvm_for_boot(
         &vm_resources.pmem.configs,
         event_manager,
     )?;
-    attach_vfio_devices(&mut device_manager, &vm, &vm_resources.vfio.configs)?;
+    attach_vfio_devices(&mut device_manager, &vm, vm_resources)?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(
@@ -787,12 +786,11 @@ fn attach_pmem_devices(
 fn attach_vfio_devices(
     device_manager: &mut DeviceManager,
     vm: &Vm,
-    configs: &[VfioDeviceConfig],
+    resources: &VmResources,
 ) -> Result<(), StartMicrovmError> {
-    if vm.as_kvm().is_some_and(|v| v.common.numa.is_some())
-        || configs.iter().any(|config| !config.pci_path.is_empty())
-    {
-        device_manager.configure_static_topology(configs)?;
+    let configs = &resources.vfio.configs;
+    if let Some(topology) = &resources.pci_topology {
+        device_manager.configure_static_topology(topology, configs)?;
     }
     let configs: Vec<(String, &std::path::Path)> = configs
         .iter()

@@ -23,9 +23,9 @@ pub struct VfioDeviceConfig {
     /// `/sys/bus/pci/devices/0000:01:00.0`. The device must already be bound to the `vfio-pci`
     /// driver on the host.
     pub path: String,
-    /// Experimental cold-boot bridge/endpoint slots. Empty retains the flat runtime.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pci_path: Vec<u8>,
+    /// Explicit guest address. Required for cold-boot VFIO assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_address: Option<super::pci_topology::PciAddress>,
 }
 
 /// Wrapper for the collection that holds all the VFIO passthrough device configs.

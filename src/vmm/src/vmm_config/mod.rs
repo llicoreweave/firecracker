@@ -235,3 +235,6 @@ mod tests {
         assert_eq!(generated_rl_conf.into_option(), Some(rl_conf));
     }
 }
+
+/// Explicit PCI bus graph.
+pub mod pci_topology;

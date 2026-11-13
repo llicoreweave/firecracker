@@ -557,7 +557,6 @@ pub struct VfioPciDevice {
     memory_enabled: bool,
     peer_container: Option<Arc<super::sys::Container>>,
     peer_mappings: Vec<super::peer_dma::PeerDmaMapping>,
-    pci_path: Vec<u8>,
 }
 
 impl Debug for VfioPciDevice {
@@ -781,7 +780,6 @@ impl VfioPciDevice {
             memory_enabled: false,
             peer_container: None,
             peer_mappings: Vec::new(),
-            pci_path: Vec::new(),
         })
     }
 
@@ -833,15 +831,6 @@ impl VfioPciDevice {
     /// The address of the device on the guest PCI bus.
     pub fn sbdf(&self) -> PciSBDF {
         self.sbdf
-    }
-
-    /// Fixed guest bridge/endpoint slots, if explicitly configured.
-    pub fn pci_path(&self) -> &[u8] {
-        &self.pci_path
-    }
-    /// Record the validated topology path before the VM starts.
-    pub fn set_pci_path(&mut self, path: Vec<u8>) {
-        self.pci_path = path;
     }
 
     /// The host sysfs path of the assigned function.

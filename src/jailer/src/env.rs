@@ -145,15 +145,10 @@ pub struct Env {
 #[derive(Debug, Default)]
 struct NumaMetadata {
     directories: Vec<PathBuf>,
-    files: Vec<(PathBuf, String)>,
 }
 
 impl NumaMetadata {
-    fn resolve(
-        sysfs: &Path,
-        nodes: &[String],
-        devices: &[(PathBuf, PathBuf)],
-    ) -> Result<Self, JailerError> {
+    fn resolve(sysfs: &Path, nodes: &[String]) -> Result<Self, JailerError> {
         let mut metadata = Self::default();
         if nodes.is_empty() {
             return Ok(metadata);
@@ -183,24 +178,13 @@ impl NumaMetadata {
                 }
             }
         }
-        for (device, _) in devices {
-            let path = device.join("numa_node");
-            let value = fs::read_to_string(&path)
-                .map_err(|e| JailerError::NumaTopology(format!("reading {path:?}: {e}")))?;
-            let node = value
-                .trim()
-                .parse::<i32>()
-                .ok()
-                .filter(|n| (-1..64).contains(n))
-                .ok_or_else(|| JailerError::NumaTopology(format!("invalid NUMA ID at {path:?}")))?;
-            metadata.files.push((path, node.to_string()));
-        }
         Ok(metadata)
     }
 }
 
 /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
 /// into it, plus a trailing newline.
+#[cfg(target_arch = "aarch64")]
 fn create_owned_file_with_data(
     dst: &Path,
     line: String,
@@ -346,7 +330,6 @@ impl Env {
         let numa_metadata = NumaMetadata::resolve(
             Path::new("/sys"),
             arguments.multiple_values("numa-node").unwrap_or_default(),
-            &vfio_iommu_group_links,
         )?;
         let vfio_dev_nodes = if vfio_iommu_group_links.is_empty() {
             Vec::new()
@@ -903,9 +886,6 @@ impl Env {
         for directory in &self.numa_metadata.directories {
             self.setup_jailed_folder(directory)?;
         }
-        for (path, value) in &self.numa_metadata.files {
-            create_owned_file_with_data(path, value.clone(), self.uid, self.gid)?;
-        }
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
@@ -995,14 +975,9 @@ mod tests {
         fs::create_dir_all(node.join("cpu2")).unwrap();
         fs::create_dir_all(node.join("memory0")).unwrap();
         fs::write(node.join("cpulist"), "0,2\n").unwrap();
-        let device = root.as_path().join("pci-device");
-        fs::create_dir(&device).unwrap();
-        fs::write(device.join("numa_node"), "0\n").unwrap();
-        let devices = vec![(device.clone(), PathBuf::from("group0"))];
-        let empty = NumaMetadata::resolve(root.as_path(), &[], &devices).unwrap();
-        assert!(empty.directories.is_empty() && empty.files.is_empty());
-        let metadata =
-            NumaMetadata::resolve(root.as_path(), &["0".into(), "0".into()], &devices).unwrap();
+        let empty = NumaMetadata::resolve(root.as_path(), &[]).unwrap();
+        assert!(empty.directories.is_empty());
+        let metadata = NumaMetadata::resolve(root.as_path(), &["0".into(), "0".into()]).unwrap();
         let mut actual = metadata.directories;
         actual.sort();
         assert_eq!(
@@ -1013,11 +988,8 @@ mod tests {
                 PathBuf::from("/sys/devices/system/node/node0/cpu2")
             ]
         );
-        assert_eq!(metadata.files, vec![(device.join("numa_node"), "0".into())]);
-        fs::remove_file(device.join("numa_node")).unwrap();
-        NumaMetadata::resolve(root.as_path(), &["0".into()], &devices).unwrap_err();
         for invalid in ["64", "-1", "../0", "garbage"] {
-            NumaMetadata::resolve(root.as_path(), &[invalid.into()], &[]).unwrap_err();
+            NumaMetadata::resolve(root.as_path(), &[invalid.into()]).unwrap_err();
         }
     }
 

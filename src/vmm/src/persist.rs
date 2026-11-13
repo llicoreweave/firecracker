@@ -165,6 +165,8 @@ pub enum CreateSnapshotError {
     VfioNotSupported,
     /// Snapshotting a NUMA microVM is not supported
     NumaNotSupported,
+    /// Snapshots do not preserve explicitly configured PCI graphs.
+    PciTopologyNotSupported,
 }
 
 /// Snapshot version
@@ -188,6 +190,14 @@ pub fn create_snapshot(
         .is_some_and(PciDevices::has_vfio_devices)
     {
         return Err(CreateSnapshotError::VfioNotSupported);
+    }
+
+    if vmm
+        .device_manager
+        .pci_devices()
+        .is_some_and(PciDevices::has_configured_topology)
+    {
+        return Err(CreateSnapshotError::PciTopologyNotSupported);
     }
 
     let microvm_state = vmm

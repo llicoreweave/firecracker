@@ -30,8 +30,6 @@ pub struct NumaNode {
     pub host_cpus: Vec<u32>,
     /// Guest RAM assigned to this domain, in MiB.
     pub memory_mib: usize,
-    /// Root-bus slots whose PCI subtrees belong to this domain.
-    pub pci_root_slots: Vec<u8>,
 }
 
 impl NumaConfig {
@@ -43,7 +41,6 @@ impl NumaConfig {
         }
         let mut seen = BTreeSet::new();
         let mut hosts = BTreeSet::new();
-        let mut slots = BTreeSet::new();
         let mut memory = 0usize;
         for (id, node) in self.nodes.iter().enumerate() {
             if node.host_node >= 64
@@ -67,11 +64,6 @@ impl NumaConfig {
                     || !hosts.insert(host)
                 {
                     return Err("NUMA CPUs must be distinct and cover the configured vCPUs".into());
-                }
-            }
-            for &slot in &node.pci_root_slots {
-                if slot == 0 || slot > 31 || !slots.insert(slot) {
-                    return Err("invalid or duplicate NUMA PCI root slot".into());
                 }
             }
             if self.distances[id]
@@ -287,11 +279,6 @@ mod tests {
                         .collect(),
                     host_cpus: (0..32).map(|c| c * 2 + id).collect(),
                     memory_mib: 524288,
-                    pci_root_slots: if id == 0 {
-                        vec![13, 14, 15, 16]
-                    } else {
-                        vec![17, 18, 19, 20, 21]
-                    },
                 })
                 .collect(),
             distances: vec![vec![10, 21], vec![21, 10]],
@@ -335,9 +322,6 @@ mod tests {
         c = config();
         c.nodes[1].memory_mib -= 2;
         c.validate(64, 1048576).unwrap_err();
-        c = config();
-        c.nodes[1].pci_root_slots.push(13);
-        c.validate(64, 1048576).unwrap_err();
     }
 
     #[test]
@@ -349,7 +333,6 @@ mod tests {
                     vcpus: vec![u8::try_from(id).unwrap()],
                     host_cpus: vec![id],
                     memory_mib: 2,
-                    pci_root_slots: vec![],
                 })
                 .collect(),
             distances: vec![vec![10, 21, 31], vec![21, 10, 21], vec![31, 21, 10]],
@@ -407,6 +390,14 @@ mod tests {
         resources.machine_config.vcpu_count = 64;
         resources.machine_config.mem_size_mib = 1048576;
         resources.numa = Some(config());
+        resources.pci_topology = Some(crate::vmm_config::pci_topology::PciTopologyConfig {
+            roots: vec![crate::vmm_config::pci_topology::PciRootConfig {
+                bus: 0,
+                last_bus: 0,
+                numa_node: Some(0),
+            }],
+            bridges: vec![],
+        });
         resources.validate_numa().unwrap();
         resources.machine_config.mem_size_mib += 2;
         resources.validate_numa().unwrap_err();
@@ -433,7 +424,6 @@ mod tests {
                     vcpus: vec![u8::try_from(id).unwrap()],
                     host_cpus: vec![id],
                     memory_mib: 2,
-                    pci_root_slots: vec![],
                 })
                 .collect(),
             distances: vec![vec![10, 21], vec![21, 10]],

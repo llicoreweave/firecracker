@@ -1361,9 +1361,11 @@ definitions:
 
   Vfio:
     type: object
+    additionalProperties: false
     required:
       - id
       - path
+      - pci_address
     properties:
       id:
         type: string
@@ -1375,15 +1377,73 @@ definitions:
           Host sysfs path of the assigned PCI function, e.g.
           /sys/bus/pci/devices/0000:01:00.0. The device must already be bound to the
           vfio-pci driver on the host.
-      pci_path:
+      pci_address:
+        $ref: "#/definitions/PciAddress"
+
+  PciAddress:
+    type: object
+    additionalProperties: false
+    required: [bus, device, function]
+    properties:
+      bus:
+        type: integer
+        minimum: 0
+        maximum: 63
+      device:
+        type: integer
+        minimum: 0
+        maximum: 31
+      function:
+        type: integer
+        enum: [0]
+
+  PciTopology:
+    type: object
+    additionalProperties: false
+    description: Caller-owned segment-zero cold-boot graph. Required for VFIO and NUMA. No layout is inferred from host devices or NUMA nodes.
+    required: [roots, bridges]
+    properties:
+      roots:
         type: array
-        minItems: 2
-        maxItems: 8
-        description: Cold-boot bridge slots followed by the endpoint slot. All guest functions are zero. Omit for the flat topology.
+        minItems: 1
         items:
-          type: integer
-          minimum: 0
-          maximum: 31
+          type: object
+          additionalProperties: false
+          required: [bus, last_bus]
+          properties:
+            bus:
+              type: integer
+              minimum: 0
+              maximum: 63
+            last_bus:
+              type: integer
+              minimum: 0
+              maximum: 63
+            numa_node:
+              type: integer
+              minimum: 0
+              maximum: 63
+              description: Guest proximity domain index in numa.nodes, emitted as _PXM. Optional without affinity.
+      bridges:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [pci_address, secondary_bus, subordinate_bus, type]
+          properties:
+            pci_address:
+              $ref: "#/definitions/PciAddress"
+            secondary_bus:
+              type: integer
+              minimum: 0
+              maximum: 63
+            subordinate_bus:
+              type: integer
+              minimum: 0
+              maximum: 63
+            type:
+              type: string
+              enum: [root-port, upstream-port, downstream-port]
 
   NumaConfig:
     type: object
@@ -1408,7 +1468,7 @@ definitions:
 
   NumaNode:
     type: object
-    required: [host_node, vcpus, host_cpus, memory_mib, pci_root_slots]
+    required: [host_node, vcpus, host_cpus, memory_mib]
     properties:
       host_node:
         type: integer
@@ -1431,12 +1491,6 @@ definitions:
         type: integer
         minimum: 2
         description: Guest RAM on this domain, in multiples of 2 MiB.
-      pci_root_slots:
-        type: array
-        items:
-          type: integer
-          minimum: 1
-          maximum: 31
 
   Error:
     type: object
@@ -1449,6 +1503,8 @@ definitions:
   FullVmConfiguration:
     type: object
     properties:
+      pci-topology:
+        $ref: "#/definitions/PciTopology"
       numa:
         $ref: "#/definitions/NumaConfig"
       balloon:

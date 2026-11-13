@@ -5,6 +5,7 @@ use std::sync::{Arc, Barrier, Mutex};
 
 use crate::pci::bus::{PciBus, PciBusError};
 use crate::pci::{PciDevice, PciSBDF};
+use crate::vmm_config::pci_topology::PciTopologyConfig;
 
 /// Fixed bridge configuration. Unknown/unimplemented capabilities are not exposed.
 #[derive(Debug)]
@@ -79,104 +80,121 @@ impl PciDevice for StaticBridge {
     }
 }
 
-/// A deterministic path-to-bus plan, validated before assigning any device.
+/// Explicit, validated bus graph. Paths are derived only for BAR containment;
+/// no host topology, NUMA placement, bus numbers or bridge types are inferred.
 #[derive(Debug)]
 pub struct StaticTopology {
+    pub config: PciTopologyConfig,
     pub buses: BTreeMap<Vec<u8>, u8>,
-    pub root_buses: BTreeMap<u8, u8>,
-    /// (root bus, last child bus, NUMA domain).
-    pub domains: Vec<(u8, u8, usize)>,
+    pub paths: BTreeMap<String, Vec<u8>>,
 }
 
 impl StaticTopology {
-    pub fn new(paths: &[Vec<u8>]) -> Result<Self, String> {
-        let mut leaves = BTreeSet::new();
-        let mut parents = BTreeSet::new();
-        for path in paths {
-            if path.len() < 2
-                || path.len() > 8
-                || path[0] == 0
-                || path.iter().any(|slot| *slot >= 32)
+    pub fn new(
+        config: &PciTopologyConfig,
+        devices: &[crate::vmm_config::vfio::VfioDeviceConfig],
+        numa_nodes: usize,
+    ) -> Result<Self, String> {
+        let invalid = || "invalid explicit PCI topology".to_string();
+        let mut roots = BTreeSet::new();
+        let mut covered = BTreeSet::new();
+        for root in &config.roots {
+            if root.bus > root.last_bus
+                || root.last_bus >= 64
+                || !roots.insert(root.bus)
+                || root.numa_node.is_some_and(|n| n as usize >= numa_nodes)
+                || (root.bus..=root.last_bus).any(|b| !covered.insert(b))
             {
-                return Err("invalid static PCI path".into());
-            }
-            if !leaves.insert(path.clone()) {
-                return Err("duplicate static PCI path".into());
-            }
-            for count in 1..path.len() {
-                parents.insert(path[..count].to_vec());
+                return Err(invalid());
             }
         }
-        if parents.iter().any(|path| leaves.contains(path)) || parents.len() >= 64 {
-            return Err("PCI endpoint used as bridge, or exhausted 64-bus budget".into());
+        if !roots.contains(&0) {
+            return Err("explicit PCI topology requires root bus zero".into());
         }
-        let buses = parents
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| (p, u8::try_from(i + 1).unwrap()))
-            .collect();
+        let mut addresses = BTreeSet::new();
+        let mut parents = BTreeMap::new();
+        for bridge in &config.bridges {
+            bridge.pci_address.validate()?;
+            if bridge.secondary_bus == bridge.pci_address.bus
+                || bridge.secondary_bus > bridge.subordinate_bus
+                || bridge.subordinate_bus >= 64
+                || roots.contains(&bridge.secondary_bus)
+                || !addresses.insert(bridge.pci_address)
+                || parents.insert(bridge.secondary_bus, bridge).is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        // Walking configured parent edges detects cycles and disconnected buses.
+        let bus_path = |mut bus: u8| -> Result<Vec<u8>, String> {
+            let mut slots = Vec::new();
+            let mut seen = BTreeSet::new();
+            while !roots.contains(&bus) {
+                if !seen.insert(bus) || seen.len() > 7 {
+                    return Err(invalid());
+                }
+                let bridge = parents.get(&bus).ok_or_else(invalid)?;
+                slots.push(bridge.pci_address.device);
+                bus = bridge.pci_address.bus;
+            }
+            slots.push(bus);
+            slots.reverse();
+            Ok(slots)
+        };
+        let mut buses = BTreeMap::new();
+        for bridge in &config.bridges {
+            let path = bus_path(bridge.secondary_bus)?;
+            let root = config.roots.iter().find(|r| r.bus == path[0]).unwrap();
+            if bridge.secondary_bus < root.bus || bridge.subordinate_bus > root.last_bus {
+                return Err(invalid());
+            }
+            // Forwarding windows must contain every child and must not overlap siblings.
+            if let Some(parent) = parents.get(&bridge.pci_address.bus)
+                && (bridge.secondary_bus < parent.secondary_bus
+                    || bridge.subordinate_bus > parent.subordinate_bus)
+            {
+                return Err(invalid());
+            }
+            for sibling in &config.bridges {
+                if sibling.pci_address.bus == bridge.pci_address.bus
+                    && sibling.pci_address != bridge.pci_address
+                    && bridge.secondary_bus <= sibling.subordinate_bus
+                    && sibling.secondary_bus <= bridge.subordinate_bus
+                {
+                    return Err(invalid());
+                }
+            }
+            buses.insert(path, bridge.secondary_bus);
+        }
+        let mut paths = BTreeMap::new();
+        for dev in devices {
+            let address = dev
+                .pci_address
+                .ok_or("every VFIO device requires pci_address")?;
+            address.validate()?;
+            if !addresses.insert(address) {
+                return Err("duplicate PCI address".into());
+            }
+            let mut path = bus_path(address.bus)?;
+            path.push(address.device);
+            if dev.id.is_empty() || paths.insert(dev.id.clone(), path).is_some() {
+                return Err("duplicate or empty VFIO id".into());
+            }
+        }
         Ok(Self {
+            config: config.clone(),
             buses,
-            root_buses: BTreeMap::new(),
-            domains: Vec::new(),
+            paths,
         })
     }
 
-    /// Keep each NUMA hierarchy under its own ACPI PCI host bridge. On x86,
-    /// Linux derives subordinate-device NUMA nodes from that root's sysdata.
-    pub fn apply_numa(&mut self, numa: &crate::numa::NumaConfig) -> Result<(), String> {
-        if numa.nodes.is_empty() || self.buses.len() + numa.nodes.len() > 64 {
-            return Err("NUMA PCI topology exhausts 64 buses".into());
-        }
-        let mut roots = BTreeSet::new();
-        for slot in numa.nodes.iter().flat_map(|node| &node.pci_root_slots) {
-            if *slot == 0 || *slot >= 32 || !roots.insert(*slot) {
-                return Err("invalid or duplicate NUMA PCI root slot".into());
-            }
-        }
-        if self.buses.keys().any(|path| !roots.contains(&path[0])) {
-            return Err("NUMA mapping does not cover every PCI root slot".into());
-        }
-        self.root_buses.clear();
-        self.domains.clear();
-        let mut next = 0usize;
-        for (domain, node) in numa.nodes.iter().enumerate() {
-            if domain != 0 {
-                next += 1;
-            }
-            let root_bus = u8::try_from(next).unwrap();
-            for &slot in &node.pci_root_slots {
-                self.root_buses.insert(slot, root_bus);
-            }
-            for (path, bus) in &mut self.buses {
-                if node.pci_root_slots.contains(&path[0]) {
-                    next += 1;
-                    if next >= 64 {
-                        return Err("NUMA PCI topology exhausts 64 buses".into());
-                    }
-                    *bus = u8::try_from(next).unwrap();
-                }
-            }
-            self.domains
-                .push((root_bus, u8::try_from(next).unwrap(), domain));
-        }
-        if self
-            .buses
-            .keys()
-            .any(|p| !self.root_buses.contains_key(&p[0]))
-        {
-            return Err("NUMA mapping does not cover every PCI root slot".into());
-        }
-        Ok(())
-    }
-
     pub fn address(&self, path: &[u8]) -> PciSBDF {
-        PciSBDF::new(
-            0,
-            self.buses[&path[..path.len() - 1]],
-            *path.last().unwrap(),
-            0,
-        )
+        let bus = if path.len() == 2 {
+            path[0]
+        } else {
+            self.buses[&path[..path.len() - 1]]
+        };
+        PciSBDF::new(0, bus, *path.last().unwrap(), 0)
     }
 
     pub fn install(
@@ -185,62 +203,50 @@ impl StaticTopology {
         ranges: &[(Vec<u8>, u64, u64, bool)],
     ) -> Result<(), PciBusError> {
         let mut root = root.lock().unwrap();
-        for &(bus, _, _) in &self.domains {
+        for bus in self
+            .config
+            .roots
+            .iter()
+            .map(|r| r.bus)
+            .chain(self.config.bridges.iter().map(|b| b.secondary_bus))
+        {
             if bus != 0 {
                 root.secondary
                     .insert(bus, Arc::new(Mutex::new(PciBus::default())));
             }
         }
-        for bus in self.buses.values() {
-            root.secondary
-                .insert(*bus, Arc::new(Mutex::new(PciBus::default())));
-        }
-        for (path, secondary) in &self.buses {
-            let primary = if path.len() == 1 {
-                self.root_buses.get(&path[0]).copied().unwrap_or(0)
-            } else {
-                self.buses[&path[..path.len() - 1]]
-            };
-            let subordinate = self
+        for bridge in &self.config.bridges {
+            let path = self
                 .buses
                 .iter()
-                .filter(|(child, _)| child.starts_with(path))
-                .map(|(_, bus)| *bus)
-                .max()
-                .unwrap();
+                .find(|(_, bus)| **bus == bridge.secondary_bus)
+                .unwrap()
+                .0;
             let window = |prefetch| {
                 let selected: Vec<_> = ranges
                     .iter()
                     .filter(|(leaf, _, _, pref)| leaf.starts_with(path) && *pref == prefetch)
                     .collect();
                 Some((
-                    selected.iter().map(|(_, start, _, _)| *start).min()?,
-                    selected
-                        .iter()
-                        .map(|(_, start, len, _)| start + len - 1)
-                        .max()?,
+                    selected.iter().map(|r| r.1).min()?,
+                    selected.iter().map(|r| r.1 + r.2 - 1).max()?,
                 ))
             };
-            let kind = match path.len() {
-                1 => 4,
-                n if n % 2 == 0 => 5,
-                _ => 6,
-            };
-            let bridge = Arc::new(Mutex::new(StaticBridge::new(
-                primary,
-                *secondary,
-                subordinate,
-                kind,
+            let device = Arc::new(Mutex::new(StaticBridge::new(
+                bridge.pci_address.bus,
+                bridge.secondary_bus,
+                bridge.subordinate_bus,
+                bridge.kind as u8,
                 window(false),
                 window(true),
             )));
-            if primary == 0 {
-                root.add_device(*path.last().unwrap(), bridge)?;
+            if bridge.pci_address.bus == 0 {
+                root.add_device(bridge.pci_address.device, device)?;
             } else {
-                root.secondary[&primary]
+                root.secondary[&bridge.pci_address.bus]
                     .lock()
                     .unwrap()
-                    .add_device(*path.last().unwrap(), bridge)?;
+                    .add_device(bridge.pci_address.device, device)?;
             }
         }
         Ok(())
@@ -250,147 +256,166 @@ impl StaticTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vmm_config::pci_topology::*;
+    use crate::vmm_config::vfio::VfioDeviceConfig;
 
-    #[test]
-    fn static_topology_counts_empty_numa_roots_in_bus_budget() {
-        use crate::numa::{NumaConfig, NumaNode};
-        let mut plan = StaticTopology::new(&[vec![1, 0]]).unwrap();
-        let mut numa = NumaConfig {
-            nodes: (0..64)
-                .map(|id| NumaNode {
-                    host_node: id,
-                    vcpus: vec![u8::try_from(id).unwrap()],
-                    host_cpus: vec![id],
-                    memory_mib: 2,
-                    pci_root_slots: if id == 0 { vec![1] } else { vec![] },
-                })
-                .collect(),
-            distances: vec![],
-        };
-        plan.apply_numa(&numa).unwrap_err();
-        assert!(plan.domains.is_empty());
-        numa.nodes.pop();
-        plan.apply_numa(&numa).unwrap();
-        assert_eq!(plan.domains.last(), Some(&(63, 63, 62)));
-        plan.apply_numa(&numa).unwrap();
-        assert_eq!(plan.domains.len(), 63);
+    fn fixture() -> (PciTopologyConfig, Vec<VfioDeviceConfig>) {
+        let config = serde_json::from_value(serde_json::json!({
+            "roots":[{"bus":40,"last_bus":50,"numa_node":0},{"bus":0,"last_bus":12,"numa_node":1},{"bus":20,"last_bus":29,"numa_node":0}],
+            "bridges":[
+                {"pci_address":{"bus":7,"device":0,"function":0},"secondary_bus":9,"subordinate_bus":9,"type":"upstream-port"},
+                {"pci_address":{"bus":0,"device":13,"function":0},"secondary_bus":7,"subordinate_bus":9,"type":"root-port"},
+                {"pci_address":{"bus":20,"device":13,"function":0},"secondary_bus":25,"subordinate_bus":25,"type":"root-port"}
+            ]
+        })).unwrap();
+        let devices = vec![VfioDeviceConfig {
+            id: "gpu".into(),
+            path: "/unavailable/host/topology".into(),
+            pci_address: Some(PciAddress {
+                bus: 9,
+                device: 3,
+                function: 0,
+            }),
+        }];
+        (config, devices)
     }
 
     #[test]
-    fn static_topology_configuration_access_reaches_secondary_buses() {
+    fn static_topology_preserves_sparse_explicit_graph_independent_of_numa() {
+        let (mut config, devices) = fixture();
+        let first = StaticTopology::new(&config, &devices, 2).unwrap();
+        let root = Arc::new(Mutex::new(PciBus::default()));
+        first.install(&root, &[]).unwrap();
+        let bus = root.lock().unwrap();
+        let port = bus.device_on_bus(0, 13).unwrap();
+        assert_eq!(port.lock().unwrap().read_config_register(6), 0x00090700);
+        let upstream = bus.device_on_bus(7, 0).unwrap();
+        assert_eq!(upstream.lock().unwrap().read_config_register(6), 0x00090907);
+        assert_eq!(
+            (upstream.lock().unwrap().read_config_register(0x40 / 4) >> 20) & 15,
+            5
+        );
+        assert!(bus.device_on_bus(1, 0).is_none());
+        assert_eq!(first.address(&first.paths["gpu"]), PciSBDF::new(0, 9, 3, 0));
+        drop(bus);
+        for r in &mut config.roots {
+            r.numa_node = Some(0);
+        }
+        config.roots.reverse();
+        config.bridges.reverse();
+        let second = StaticTopology::new(&config, &devices, 1).unwrap();
+        assert_eq!(first.buses, second.buses);
+        assert_eq!(first.paths, second.paths);
+    }
+
+    #[test]
+    fn static_topology_rejects_invalid_graphs_and_missing_addresses() {
+        let (config, devices) = fixture();
+        let bad: [fn(&mut PciTopologyConfig); 12] = [
+            |c| c.roots[0].bus = 10, // overlapping roots
+            |c| c.roots[1].bus = 1,  // missing root zero
+            |c| c.roots[0].numa_node = Some(2),
+            |c| c.roots[0].last_bus = 64,
+            |c| c.bridges[0].pci_address.bus = 8, // disconnected
+            |c| c.bridges[0].secondary_bus = 7,   // duplicate secondary bus
+            |c| c.bridges[0].subordinate_bus = 10, // escapes parent
+            |c| c.bridges[1].pci_address.bus = 9, // cycle
+            |c| c.bridges[2].secondary_bus = 40,  // collides with root
+            |c| c.bridges[0].pci_address.function = 1,
+            |c| c.bridges[1].pci_address.device = 0,
+            |c| c.bridges.push(c.bridges[1].clone()),
+        ];
+        for change in bad {
+            let mut c = config.clone();
+            change(&mut c);
+            StaticTopology::new(&c, &devices, 2).unwrap_err();
+        }
+        for address in [
+            None,
+            Some(PciAddress {
+                bus: 8,
+                device: 0,
+                function: 0,
+            }),
+            Some(PciAddress {
+                bus: 7,
+                device: 0,
+                function: 0,
+            }),
+            Some(PciAddress {
+                bus: 9,
+                device: 32,
+                function: 0,
+            }),
+        ] {
+            let mut d = devices.clone();
+            d[0].pci_address = address;
+            StaticTopology::new(&config, &d, 2).unwrap_err();
+        }
+        let mut duplicate = devices.clone();
+        duplicate.push(devices[0].clone());
+        StaticTopology::new(&config, &duplicate, 2).unwrap_err();
+        serde_json::from_str::<VfioDeviceConfig>(r#"{"id":"gpu","path":"/host","pci_path":[1,0]}"#)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn static_topology_ecam_io_and_fixed_bridge_registers() {
         use crate::pci::bus::{PciConfigIo, PciConfigMmio};
         use crate::vstate::bus::BusDevice;
-        let plan = StaticTopology::new(&[vec![1, 2, 0]]).unwrap();
+        let (config, devices) = fixture();
+        let plan = StaticTopology::new(&config, &devices, 2).unwrap();
         let root = Arc::new(Mutex::new(PciBus::default()));
         plan.install(&root, &[]).unwrap();
         let mut ecam = PciConfigMmio::new(root.clone());
-        let mut io = PciConfigIo::new(root);
-        let address = (1 << 20) | (2 << 15);
+        let mut io = PciConfigIo::new(root.clone());
         let mut data = [0; 4];
-        ecam.read(0, address, &mut data);
+        ecam.read(0, 7 << 20, &mut data);
         assert_eq!(data, [0x0f, 0x1d, 1, 2]);
-        io.write(
-            0,
-            0,
-            &(0x8000_0000u32 | (1 << 16) | (2 << 11)).to_le_bytes(),
-        );
+        io.write(0, 0, &(0x80000000u32 | (7 << 16)).to_le_bytes());
         assert_eq!(io.config_space_read(), u32::from_le_bytes(data));
-        ecam.read(0, address | (1 << 12), &mut data);
+        ecam.read(0, (7 << 20) | (1 << 12), &mut data);
         assert_eq!(data, [0xff; 4]);
-        ecam.read(0, 63 << 20, &mut data);
-        assert_eq!(data, [0xff; 4]);
-    }
-    #[test]
-    fn static_topology_numa_has_separate_root_buses() {
-        use crate::numa::{NumaConfig, NumaNode};
-        let mut paths = Vec::new();
-        for root in [13, 14, 15, 16, 18, 19, 20, 21] {
-            paths.push(vec![root, 0, 1, 0]);
-            paths.push(vec![root, 0, 2, 0]);
-        }
-        for slot in 0..4 {
-            paths.push(vec![17, 0, slot, 0]);
-        }
-        let numa = NumaConfig {
-            nodes: (0..2)
-                .map(|id| NumaNode {
-                    host_node: id,
-                    vcpus: vec![u8::try_from(id).unwrap()],
-                    host_cpus: vec![id],
-                    memory_mib: 1024,
-                    pci_root_slots: if id == 0 {
-                        vec![13, 14, 15, 16]
-                    } else {
-                        vec![17, 18, 19, 20, 21]
-                    },
-                })
-                .collect(),
-            distances: vec![vec![10, 21], vec![21, 10]],
-        };
-        let mut plan = StaticTopology::new(&paths).unwrap();
-        plan.apply_numa(&numa).unwrap();
-        assert_eq!(plan.domains, vec![(0, 16, 0), (17, 39, 1)]);
-        assert_eq!(plan.address(&[18, 0, 1, 0]).bus(), 26);
-        let root = Arc::new(Mutex::new(PciBus::default()));
-        plan.install(&root, &[]).unwrap();
-        let bus = root.lock().unwrap();
-        assert!(bus.device_on_bus(0, 17).is_none());
-        let rp = bus.device_on_bus(17, 17).unwrap();
-        let buses = rp.lock().unwrap().read_config_register(6);
-        assert_eq!(buses & 0xff, 17);
-        assert_eq!((buses >> 8) & 0xff, 18);
-    }
-    #[test]
-    fn static_topology_pairs_share_upstream_switch() {
-        let paths = vec![vec![16, 0, 1, 0], vec![16, 0, 2, 0], vec![17, 0, 1, 0]];
-        let plan = StaticTopology::new(&paths).unwrap();
-        assert_eq!(plan.buses.len(), 7);
-        assert_ne!(plan.address(&paths[0]).bus(), plan.address(&paths[1]).bus());
-        let root = Arc::new(Mutex::new(PciBus::default()));
-        plan.install(&root, &[(paths[0].clone(), 2 << 40, 128 << 30, true)])
-            .unwrap();
-        let upstream = root
-            .lock()
-            .unwrap()
-            .device_on_bus(plan.buses[&vec![16]], 0)
-            .unwrap();
-        assert_eq!(
-            (upstream.lock().unwrap().read_config_register(0x42 / 4) >> 20) & 15,
-            5
-        );
-        assert!(root.lock().unwrap().device_on_bus(63, 0).is_none());
-    }
-    #[test]
-    fn static_topology_rejects_invalid_and_conflicting_paths() {
-        for paths in [
-            vec![vec![32, 0]],
-            vec![vec![1]],
-            vec![vec![1, 0], vec![1, 0]],
-            vec![vec![1, 0], vec![1, 0, 0]],
-        ] {
-            StaticTopology::new(&paths).unwrap_err();
-        }
+        ecam.write(0, (7 << 20) | 0x18, &[0; 4]);
+        ecam.read(0, (7 << 20) | 0x18, &mut data);
+        assert_eq!(data, [7, 9, 9, 0]);
     }
 
     #[test]
-    fn static_topology_full_h100_fabric_fits_ecam() {
-        let mut paths = Vec::new();
-        for root in [13, 14, 15, 16, 18, 19, 20, 21] {
-            paths.push(vec![root, 0, 1, 0]);
-            paths.push(vec![root, 0, 2, 0]);
+    fn static_topology_materializes_kata_wire_contract() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Contract {
+            #[serde(rename = "pci-topology")]
+            topology: PciTopologyConfig,
+            vfio: Vec<VfioDeviceConfig>,
+            numa: crate::numa::NumaConfig,
         }
-        for slot in 0..4 {
-            paths.push(vec![17, 0, slot, 0]);
-        }
-        let plan = StaticTopology::new(&paths).unwrap();
-        assert_eq!(plan.buses.len(), 38);
-        assert_eq!(plan.buses.values().copied().max(), Some(38));
+        let data = include_str!("../../../../../docs/fixtures/kata-pci-topology.json");
+        let contract: Contract = serde_json::from_str(data).unwrap();
+        contract.numa.validate(3, 10).unwrap();
+        let plan = StaticTopology::new(
+            &contract.topology,
+            &contract.vfio,
+            contract.numa.nodes.len(),
+        )
+        .unwrap();
         let root = Arc::new(Mutex::new(PciBus::default()));
         plan.install(&root, &[]).unwrap();
-        for path in paths {
-            let address = plan.address(&path);
-            assert!(address.bus() < 64);
-            assert_eq!(address.function(), 0);
+        assert_eq!(
+            plan.config
+                .roots
+                .iter()
+                .map(|r| (r.bus, r.last_bus, r.numa_node))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, Some(0)), (5, 8, Some(1))]
+        );
+        for (i, device) in contract.vfio.iter().enumerate() {
+            let address = plan.address(&plan.paths[&device.id]);
+            assert_eq!(address.bus(), [3, 4, 8][i]);
+            assert_eq!(address.device(), 0);
         }
+        let bridge = root.lock().unwrap().device_on_bus(5, 14).unwrap();
+        assert_eq!(bridge.lock().unwrap().read_config_register(6), 0x00080605);
     }
 }

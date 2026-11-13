@@ -555,6 +555,9 @@ pub struct VfioPciDevice {
     /// Whether the device currently decodes memory accesses (Memory Space enabled and not in
     /// D3hot), i.e. whether the BAR memory slots are present.
     memory_enabled: bool,
+    peer_container: Option<Arc<super::sys::Container>>,
+    peer_mappings: Vec<super::peer_dma::PeerDmaMapping>,
+    pci_path: Vec<u8>,
 }
 
 impl Debug for VfioPciDevice {
@@ -776,6 +779,9 @@ impl VfioPciDevice {
             regions: Vec::new(),
             rom,
             memory_enabled: false,
+            peer_container: None,
+            peer_mappings: Vec::new(),
+            pci_path: Vec::new(),
         })
     }
 
@@ -827,6 +833,15 @@ impl VfioPciDevice {
     /// The address of the device on the guest PCI bus.
     pub fn sbdf(&self) -> PciSBDF {
         self.sbdf
+    }
+
+    /// Fixed guest bridge/endpoint slots, if explicitly configured.
+    pub fn pci_path(&self) -> &[u8] {
+        &self.pci_path
+    }
+    /// Record the validated topology path before the VM starts.
+    pub fn set_pci_path(&mut self, path: Vec<u8>) {
+        self.pci_path = path;
     }
 
     /// The host sysfs path of the assigned function.
@@ -960,6 +975,59 @@ impl VfioPciDevice {
             .map_err(VfioPciError::RegisterMemoryRegion)
     }
 
+    /// Opt this private runtime into host BAR exports. Only large prefetchable
+    /// GPU memory windows are shared for NIC-initiated GPUDirect RDMA.
+    pub fn enable_peer_dma(&mut self, container: Arc<super::sys::Container>) {
+        self.peer_container = Some(container);
+        self.refresh_peer_dma();
+    }
+
+    fn refresh_peer_dma(&mut self) {
+        if !self.memory_enabled || !self.peer_mappings.is_empty() {
+            return;
+        }
+        let Some(container) = &self.peer_container else {
+            return;
+        };
+        for region in &self.regions {
+            if region.window != BarWindow::Mmio64 || region.size < (1 << 30) {
+                continue;
+            }
+            match super::peer_dma::PeerDmaMapping::new(
+                container,
+                self.device.mmap_fd(),
+                region.index,
+                0,
+                region.size,
+                region.guest_addr,
+            ) {
+                Ok(mapping) => self.peer_mappings.push(mapping),
+                Err(err) => error!(
+                    "peer-dma: {} BAR{} import FAILED: {err}; GPUDirect is not qualified",
+                    self.host_name, region.index
+                ),
+            }
+        }
+    }
+
+    /// Quiesce bus mastering before the VM's peer resources are released.
+    pub fn stop_dma(&mut self) {
+        let mut command = [0u8; 2];
+        if self.read_config(COMMAND, &mut command) {
+            let stopped = u16::from_le_bytes(command) & !4;
+            if let Err(err) = self.device.write_region(
+                VFIO_PCI_CONFIG_REGION_INDEX,
+                u64::from(COMMAND),
+                &stopped.to_le_bytes(),
+            ) {
+                error!(
+                    "peer-dma: {} cannot stop bus mastering: {err}",
+                    self.host_name
+                );
+            }
+        }
+    }
+
     /// The guest physical ranges `(start, len)` to register on the MMIO bus: every BAR and the
     /// expansion ROM. Accesses only trap where no memory slot is present.
     pub fn mmio_ranges(&self) -> Vec<(u64, u64)> {
@@ -1013,12 +1081,18 @@ impl VfioPciDevice {
 
     /// Add or remove the BAR memory slots.
     fn set_memory_enabled(&mut self, enabled: bool) -> Result<(), VmError> {
+        if !enabled {
+            self.peer_mappings.clear();
+        }
         for region in &mut self.regions {
             for mapping in &mut region.mappings {
                 mapping.set_present(&self.vm, enabled)?;
             }
         }
         self.memory_enabled = enabled;
+        if enabled {
+            self.refresh_peer_dma();
+        }
         Ok(())
     }
 
@@ -1112,6 +1186,14 @@ impl VfioPciDevice {
             let old = self.regions[region].guest_addr;
             let new = self.bars.get_bar_addr(index);
             if new == old {
+                continue;
+            }
+            if self.peer_container.is_some() {
+                error!(
+                    "Static topology refuses BAR relocation: {} BAR{index} {old:#x} -> {new:#x}",
+                    self.host_name
+                );
+                self.set_bar_address(index, old);
                 continue;
             }
             match self.relocate_region(region, new) {
@@ -1587,6 +1669,8 @@ impl BusDevice for VfioPciDevice {
 
 impl Drop for VfioPciDevice {
     fn drop(&mut self) {
+        self.stop_dma();
+        self.peer_mappings.clear();
         // Take the BARs out of the guest address space before their host mappings go away. The
         // host interrupts need no teardown: closing the device file disables them
         // (`vfio_pci_core_close_device`), and dropping the vector groups deassigns the MSI and

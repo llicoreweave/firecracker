@@ -181,6 +181,7 @@ pub fn build_microvm_for_boot(
     // Set up KVM VM and register memory regions.
     // Build custom CPU config if a custom template is provided.
     let mut vm = KvmVm::new(kvm)?;
+    vm.common.numa = vm_resources.numa.clone();
     let mut vcpus = vm.create_vcpus(vm_resources.machine_config.vcpu_count)?;
     vm.register_dram_memory_regions(guest_memory)?;
 
@@ -788,6 +789,11 @@ fn attach_vfio_devices(
     vm: &Vm,
     configs: &[VfioDeviceConfig],
 ) -> Result<(), StartMicrovmError> {
+    if vm.as_kvm().is_some_and(|v| v.common.numa.is_some())
+        || configs.iter().any(|config| !config.pci_path.is_empty())
+    {
+        device_manager.configure_static_topology(configs)?;
+    }
     let configs: Vec<(String, &std::path::Path)> = configs
         .iter()
         .map(|config| (config.id.clone(), std::path::Path::new(&config.path)))
@@ -1593,6 +1599,7 @@ pub(crate) mod tests {
             .insert(VfioDeviceConfig {
                 id: "gpu0".to_string(),
                 path: "/sys/bus/pci/devices/0000:01:00.0".to_string(),
+                ..Default::default()
             })
             .unwrap();
         assert!(matches!(

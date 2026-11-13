@@ -264,7 +264,7 @@ impl DeviceManager {
         vm: &Arc<KvmVm>,
     ) -> Result<VirtioDevices, PciManagerError> {
         if pci_enabled {
-            Ok(VirtioDevices::Pci(PciDevices::new(vm)?))
+            Ok(VirtioDevices::Pci(Box::new(PciDevices::new(vm)?)))
         } else {
             Ok(VirtioDevices::Mmio(MMIOVirtioDevices::new()))
         }
@@ -291,6 +291,18 @@ impl DeviceManager {
                 .attach_pci_virtio_device(vm, id, device, event_manager)
                 .map_err(AttachDeviceError::from),
         }
+    }
+
+    /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
+    pub(crate) fn configure_static_topology(
+        &mut self,
+        configs: &[crate::vmm_config::vfio::VfioDeviceConfig],
+    ) -> Result<(), AttachDeviceError> {
+        let VirtioDevices::Pci(pci) = &mut self.virtio_devices else {
+            return Err(AttachDeviceError::PciNotEnabled);
+        };
+        pci.configure_static_topology(configs)?;
+        Ok(())
     }
 
     /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
@@ -593,7 +605,7 @@ impl DeviceManager {
 #[derive(Debug)]
 pub enum VirtioDevices {
     Mmio(MMIOVirtioDevices),
-    Pci(PciDevices),
+    Pci(Box<PciDevices>),
 }
 
 impl Default for VirtioDevices {
@@ -770,7 +782,7 @@ impl<'a> Persist<'a> for DeviceManager {
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
-                VirtioDevices::Pci(pci_devices)
+                VirtioDevices::Pci(Box::new(pci_devices))
             }
             VirtioDevicesState::Mmio(mmio_state) => {
                 let mmio_ctor_args = MMIODevManagerConstructorArgs {
@@ -845,7 +857,7 @@ pub(crate) mod tests {
 
     pub(crate) fn default_device_manager_with_pci(vm: &Arc<KvmVm>) -> DeviceManager {
         let mut device_manager = default_device_manager();
-        device_manager.virtio_devices = VirtioDevices::Pci(PciDevices::new(vm).unwrap());
+        device_manager.virtio_devices = VirtioDevices::Pci(Box::new(PciDevices::new(vm).unwrap()));
         device_manager
     }
 

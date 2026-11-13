@@ -274,11 +274,16 @@ pub struct IommuInfo {
 impl Container {
     /// Open `/dev/vfio/vfio` and check that the kernel provides the type1v2 IOMMU backend.
     pub fn open() -> Result<Self, VfioSysError> {
+        Self::open_at(VFIO_CONTAINER_PATH)
+    }
+
+    /// Open a legacy container or the compatible /dev/iommu backend.
+    pub fn open_at(path: &str) -> Result<Self, VfioSysError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(VFIO_CONTAINER_PATH)
-            .map_err(|err| VfioSysError::Open(VFIO_CONTAINER_PATH.to_string(), err))?;
+            .open(path)
+            .map_err(|err| VfioSysError::Open(path.to_string(), err))?;
         let container = Container { file };
 
         // SAFETY: `container` wraps a VFIO container fd and the request takes no argument.

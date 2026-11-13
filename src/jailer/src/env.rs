@@ -138,11 +138,69 @@ pub struct Env {
     // `iommu_group` links of the VFIO devices to recreate inside the chroot, as
     // (sysfs path of the device, link target) pairs.
     vfio_iommu_group_links: Vec<(PathBuf, PathBuf)>,
+    numa_metadata: NumaMetadata,
+}
+
+/// A snapshot of selected host topology facts, without mounting host sysfs.
+#[derive(Debug, Default)]
+struct NumaMetadata {
+    directories: Vec<PathBuf>,
+    files: Vec<(PathBuf, String)>,
+}
+
+impl NumaMetadata {
+    fn resolve(
+        sysfs: &Path,
+        nodes: &[String],
+        devices: &[(PathBuf, PathBuf)],
+    ) -> Result<Self, JailerError> {
+        let mut metadata = Self::default();
+        if nodes.is_empty() {
+            return Ok(metadata);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in nodes {
+            let node =
+                raw.parse::<u32>().ok().filter(|n| *n < 64).ok_or_else(|| {
+                    JailerError::NumaTopology(format!("invalid host node {raw:?}"))
+                })?;
+            if !seen.insert(node) {
+                continue;
+            }
+            let relative = format!("devices/system/node/node{node}");
+            let destination = Path::new("/sys").join(&relative);
+            let entries = fs::read_dir(sysfs.join(&relative))
+                .map_err(|e| JailerError::NumaTopology(format!("reading node {node}: {e}")))?;
+            metadata.directories.push(destination.clone());
+            for entry in entries {
+                let entry = entry.map_err(|e| JailerError::NumaTopology(e.to_string()))?;
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or_default();
+                if name.strip_prefix("cpu").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+                }) {
+                    metadata.directories.push(destination.join(name));
+                }
+            }
+        }
+        for (device, _) in devices {
+            let path = device.join("numa_node");
+            let value = fs::read_to_string(&path)
+                .map_err(|e| JailerError::NumaTopology(format!("reading {path:?}: {e}")))?;
+            let node = value
+                .trim()
+                .parse::<i32>()
+                .ok()
+                .filter(|n| (-1..64).contains(n))
+                .ok_or_else(|| JailerError::NumaTopology(format!("invalid NUMA ID at {path:?}")))?;
+            metadata.files.push((path, node.to_string()));
+        }
+        Ok(metadata)
+    }
 }
 
 /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
 /// into it, plus a trailing newline.
-#[cfg(target_arch = "aarch64")]
 fn create_owned_file_with_data(
     dst: &Path,
     line: String,
@@ -285,6 +343,11 @@ impl Env {
 
         let vfio_args: &[String] = arguments.multiple_values("vfio-device").unwrap_or_default();
         let vfio_iommu_group_links = Self::resolve_vfio_iommu_group_links(vfio_args)?;
+        let numa_metadata = NumaMetadata::resolve(
+            Path::new("/sys"),
+            arguments.multiple_values("numa-node").unwrap_or_default(),
+            &vfio_iommu_group_links,
+        )?;
         let vfio_dev_nodes = if vfio_iommu_group_links.is_empty() {
             Vec::new()
         } else {
@@ -309,6 +372,7 @@ impl Env {
             uffd_dev_minor,
             vfio_dev_nodes,
             vfio_iommu_group_links,
+            numa_metadata,
         })
     }
 
@@ -365,6 +429,13 @@ impl Env {
         let container = PathBuf::from("/dev/vfio/vfio");
         let (major, minor) = Self::host_dev_numbers(&container)?;
         nodes.push((container, major, minor));
+
+        // Private topology runtime uses IOMMUFD's VFIO compatibility backend.
+        let iommu = PathBuf::from("/dev/iommu");
+        if iommu.exists() {
+            let (major, minor) = Self::host_dev_numbers(&iommu)?;
+            nodes.push((iommu, major, minor));
+        }
 
         let mut seen_groups = std::collections::HashSet::new();
         for (sysfs_path, group_target) in iommu_group_links {
@@ -827,6 +898,15 @@ impl Env {
                 .map_err(|err| JailerError::VfioDevice(format!("cannot create {link:?}: {err}")))?;
         }
 
+        // These are inert metadata copies captured before chroot, not host
+        // sysfs mounts. Only explicitly requested NUMA nodes are represented.
+        for directory in &self.numa_metadata.directories {
+            self.setup_jailed_folder(directory)?;
+        }
+        for (path, value) in &self.numa_metadata.files {
+            create_owned_file_with_data(path, value.clone(), self.uid, self.gid)?;
+        }
+
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
         // Daemonize before exec, if so required (when the dev_null variable != None).
@@ -906,6 +986,40 @@ mod tests {
     use super::*;
     use crate::build_arg_parser;
     use crate::cgroup::test_util::MockCgroupFs;
+
+    #[test]
+    fn test_numa_metadata_is_scoped_and_opt_in() {
+        let root = TempDir::new().unwrap();
+        let node = root.as_path().join("devices/system/node/node0");
+        fs::create_dir_all(node.join("cpu0")).unwrap();
+        fs::create_dir_all(node.join("cpu2")).unwrap();
+        fs::create_dir_all(node.join("memory0")).unwrap();
+        fs::write(node.join("cpulist"), "0,2\n").unwrap();
+        let device = root.as_path().join("pci-device");
+        fs::create_dir(&device).unwrap();
+        fs::write(device.join("numa_node"), "0\n").unwrap();
+        let devices = vec![(device.clone(), PathBuf::from("group0"))];
+        let empty = NumaMetadata::resolve(root.as_path(), &[], &devices).unwrap();
+        assert!(empty.directories.is_empty() && empty.files.is_empty());
+        let metadata =
+            NumaMetadata::resolve(root.as_path(), &["0".into(), "0".into()], &devices).unwrap();
+        let mut actual = metadata.directories;
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                PathBuf::from("/sys/devices/system/node/node0"),
+                PathBuf::from("/sys/devices/system/node/node0/cpu0"),
+                PathBuf::from("/sys/devices/system/node/node0/cpu2")
+            ]
+        );
+        assert_eq!(metadata.files, vec![(device.join("numa_node"), "0".into())]);
+        fs::remove_file(device.join("numa_node")).unwrap();
+        NumaMetadata::resolve(root.as_path(), &["0".into()], &devices).unwrap_err();
+        for invalid in ["64", "-1", "../0", "garbage"] {
+            NumaMetadata::resolve(root.as_path(), &[invalid.into()], &[]).unwrap_err();
+        }
+    }
 
     fn get_pseudo_exec_file_path() -> String {
         format!(

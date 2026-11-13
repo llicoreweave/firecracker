@@ -64,6 +64,56 @@ impl std::fmt::Debug for PciSegment {
 }
 
 impl PciSegment {
+    /// A separate ACPI host bridge for a private NUMA domain, in segment zero.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn append_numa_root(
+        v: &mut Vec<u8>,
+        mmio_config_address: u64,
+        first: u8,
+        last: u8,
+        domain: u32,
+        mem32: &[(u64, u64)],
+        mem64: &[(u64, u64)],
+    ) -> Result<(), aml::AmlError> {
+        let bus = aml::AddressSpace::new_bus_number(first as u16, last as u16)?;
+        let windows: Vec<_> = mem32
+            .iter()
+            .map(|&(a, b)| {
+                aml::AddressSpace::new_memory(aml::AddressSpaceCacheable::NotCacheable, true, a, b)
+            })
+            .chain(mem64.iter().map(|&(a, b)| {
+                aml::AddressSpace::new_memory(aml::AddressSpaceCacheable::PreFetchable, true, a, b)
+            }))
+            .collect::<Result<_, _>>()?;
+        let ecam = aml::Memory32Fixed::new(
+            true,
+            u32::try_from(mmio_config_address).unwrap(),
+            u32::try_from(PCI_MMIO_CONFIG_SIZE_PER_SEGMENT).unwrap(),
+        );
+        let mut resources: Vec<&dyn Aml> = vec![&bus];
+        if domain == 0 {
+            resources.push(&ecam);
+        }
+        for window in &windows {
+            resources.push(window);
+        }
+        aml::Device::new(
+            format!("_SB_.PC{domain:02X}").as_str().try_into()?,
+            vec![
+                &aml::Name::new("_HID".try_into()?, &aml::EisaName::new("PNP0A08")?)?,
+                &aml::Name::new("_CID".try_into()?, &aml::EisaName::new("PNP0A03")?)?,
+                &aml::Name::new("_SEG".try_into()?, &0u16)?,
+                &aml::Name::new("_BBN".try_into()?, &first)?,
+                &aml::Name::new("_UID".try_into()?, &domain)?,
+                &aml::Name::new("_PXM".try_into()?, &domain)?,
+                &aml::Name::new("_CCA".try_into()?, &aml::ONE)?,
+                &aml::Name::new("_CRS".try_into()?, &aml::ResourceTemplate::new(resources))?,
+                &PciDsmMethod {},
+            ],
+        )
+        .append_aml_bytes(v)
+    }
+
     fn build(id: u16, vm: &Arc<KvmVm>, pci_irq_slots: &[u8; 32]) -> Result<PciSegment, BusError> {
         let host_bridge = PciHostBridge::new(None);
         let pci_bus = Arc::new(Mutex::new(PciBus::new(host_bridge)));
@@ -265,7 +315,7 @@ impl Aml for PciSegment {
             aml::Name::new(
                 "_CRS".try_into()?,
                 &aml::ResourceTemplate::new(vec![
-                    &aml::AddressSpace::new_bus_number(0x0u16, 0x0u16)?,
+                    &aml::AddressSpace::new_bus_number(0x0u16, 63u16)?,
                     &aml::Io::new(0xcf8, 0xcf8, 1, 0x8),
                     &aml::Memory32Fixed::new(
                         true,
@@ -292,7 +342,7 @@ impl Aml for PciSegment {
             aml::Name::new(
                 "_CRS".try_into()?,
                 &aml::ResourceTemplate::new(vec![
-                    &aml::AddressSpace::new_bus_number(0x0u16, 0x0u16)?,
+                    &aml::AddressSpace::new_bus_number(0x0u16, 63u16)?,
                     &aml::Memory32Fixed::new(
                         true,
                         self.mmio_config_address.try_into().unwrap(),
@@ -350,6 +400,35 @@ impl Aml for PciSegment {
 mod tests {
 
     use super::*;
+    #[test]
+    fn numa_root_aml_describes_two_host_bridges() {
+        let mut bytes = Vec::new();
+        PciSegment::append_numa_root(
+            &mut bytes,
+            PCI_MMCONFIG_START,
+            0,
+            16,
+            0,
+            &[(0xc0000000, 0xcfffffff)],
+            &[(2 << 40, (3 << 40) - 1)],
+        )
+        .unwrap();
+        PciSegment::append_numa_root(
+            &mut bytes,
+            PCI_MMCONFIG_START,
+            17,
+            39,
+            1,
+            &[(0xd0000000, 0xdfffffff)],
+            &[(3 << 40, (4 << 40) - 1)],
+        )
+        .unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"PC00"));
+        assert!(bytes.windows(4).any(|w| w == b"PC01"));
+        for name in [b"_BBN", b"_PXM", b"_UID", b"_CRS"] {
+            assert_eq!(bytes.windows(4).filter(|w| *w == name).count(), 2);
+        }
+    }
     use crate::arch;
     use crate::builder::tests::default_vmm;
     use crate::utils::u64_to_usize;
@@ -426,12 +505,20 @@ mod tests {
         let pci_irq_slots = &[0u8; 32];
         let pci_segment = PciSegment::new(0, &kvm_vm, pci_irq_slots).unwrap();
 
-        let mut data = [0u8; u64_to_usize(PCI_MMIO_CONFIG_SIZE_PER_SEGMENT)];
+        let mut data = [0u8; 4];
 
         kvm_vm
             .common
             .mmio_bus
             .read(pci_segment.mmio_config_address, &mut data)
+            .unwrap();
+        kvm_vm
+            .common
+            .mmio_bus
+            .read(
+                pci_segment.mmio_config_address + PCI_MMIO_CONFIG_SIZE_PER_SEGMENT - 4,
+                &mut data,
+            )
             .unwrap();
         kvm_vm
             .common

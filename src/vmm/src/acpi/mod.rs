@@ -33,6 +33,8 @@ const HYPERVISOR_VENDOR_ID: [u8; 8] = *b"FIRECKVM";
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 /// Error type for ACPI related operations
 pub enum AcpiError {
+    /// Invalid NUMA memory layout: {0}
+    Numa(String),
     /// Could not allocate resources: {0}
     VmAllocator(#[from] vm_allocator::Error),
     /// ACPI tables error: {0}
@@ -141,13 +143,11 @@ impl AcpiTableWriter<'_> {
         fadt_addr: u64,
         madt_addr: u64,
         mcfg_addr: u64,
+        numa_addrs: Vec<u64>,
     ) -> Result<u64, AcpiError> {
-        let mut xsdt = Xsdt::new(
-            OEM_ID,
-            *b"FCMVXSDT",
-            OEM_REVISION,
-            vec![fadt_addr, madt_addr, mcfg_addr],
-        );
+        let mut addresses = vec![fadt_addr, madt_addr, mcfg_addr];
+        addresses.extend(numa_addrs);
+        let mut xsdt = Xsdt::new(OEM_ID, *b"FCMVXSDT", OEM_REVISION, addresses);
         self.write_acpi_table(resource_allocator, &mut xsdt)
     }
 
@@ -189,6 +189,7 @@ pub(crate) fn create_acpi_tables(
     device_manager: &mut DeviceManager,
     resource_allocator: &mut ResourceAllocator,
     vcpus: &[Vcpu],
+    numa: Option<&crate::numa::NumaConfig>,
 ) -> Result<(), AcpiError> {
     let mut writer = AcpiTableWriter { mem };
     let dsdt_addr = writer.build_dsdt(device_manager, resource_allocator)?;
@@ -196,7 +197,25 @@ pub(crate) fn create_acpi_tables(
     let fadt_addr = writer.build_fadt(resource_allocator, dsdt_addr)?;
     let madt_addr = writer.build_madt(resource_allocator, vcpus.len().try_into().unwrap())?;
     let mcfg_addr = writer.build_mcfg(resource_allocator, layout::PCI_MMCONFIG_START)?;
-    let xsdt_addr = writer.build_xsdt(resource_allocator, fadt_addr, madt_addr, mcfg_addr)?;
+    let mut numa_addrs = Vec::new();
+    if let Some(numa) = numa {
+        use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+        let ranges: Vec<_> = mem
+            .iter()
+            .map(|r| (r.start_addr(), usize::try_from(r.len()).unwrap()))
+            .collect();
+        let layout = numa.regions(&ranges).map_err(AcpiError::Numa)?;
+        let (mut srat, mut slit) = numa.tables(&layout);
+        numa_addrs.push(writer.write_acpi_table(resource_allocator, &mut srat)?);
+        numa_addrs.push(writer.write_acpi_table(resource_allocator, &mut slit)?);
+    }
+    let xsdt_addr = writer.build_xsdt(
+        resource_allocator,
+        fadt_addr,
+        madt_addr,
+        mcfg_addr,
+        numa_addrs,
+    )?;
     writer.build_rsdp(xsdt_addr)
 }
 

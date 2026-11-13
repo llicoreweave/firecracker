@@ -152,6 +152,8 @@ const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HU
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
+    /// Failed to bind private NUMA RAM: {0}
+    Numa(io::Error),
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
     /// Cannot create mmap region: {0}

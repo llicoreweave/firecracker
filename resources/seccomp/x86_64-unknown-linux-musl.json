@@ -4,6 +4,31 @@
         "filter_action": "allow",
         "filter": [
             {
+                "syscall": "fcntl",
+                "comment": "F_DUPFD_CLOEXEC for the peer mapping IOAS reference",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1030}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "VFIO_DEVICE_FEATURE: export assigned peer BAR DMA-BUF",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15221}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_VFIO_IOAS: query this VM's compatibility IOAS",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15240}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_IOAS_MAP_FILE: import assigned peer BAR",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15247}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_IOAS_UNMAP: release assigned peer BAR",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15238}]
+            },
+            {
                 "syscall": "stat",
                 "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata"
             },
@@ -1108,6 +1133,39 @@
         "default_action": "trap",
         "filter_action": "allow",
         "filter": [
+            {
+                "syscall": "ioctl",
+                "comment": "VFIO_DEVICE_FEATURE: export assigned peer BAR DMA-BUF",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15221}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_VFIO_IOAS: query this VM's compatibility IOAS",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15240}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_IOAS_MAP_FILE: import assigned peer BAR",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15247}]
+            },
+            {
+                "syscall": "ioctl",
+                "comment": "IOMMU_IOAS_UNMAP: release assigned peer BAR",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 15238}]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "F_DUPFD_CLOEXEC for a peer mapping's owned IOAS reference",
+                "args": [{"index": 1, "type": "dword", "op": "eq", "val": 1030}]
+            },
+            {
+                "syscall": "fcntl",
+                "comment": "Set FD_CLOEXEC on a newly exported VFIO DMA-BUF during guest PCI probing",
+                "args": [
+                    {"index": 1, "type": "dword", "op": "eq", "val": 2},
+                    {"index": 2, "type": "dword", "op": "eq", "val": 1}
+                ]
+            },
             {
                 "syscall": "exit"
             },

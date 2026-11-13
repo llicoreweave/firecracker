@@ -90,6 +90,8 @@ pub mod gdb;
 pub mod logger;
 /// microVM Metadata Service MMDS
 pub mod mmds;
+/// Private cold-boot NUMA support.
+pub mod numa;
 /// PCI specific emulation code.
 pub mod pci;
 /// Save/restore utilities.
@@ -422,6 +424,7 @@ impl Vmm {
                 VfioDeviceConfig {
                     id: dev.id().to_string(),
                     path: dev.sysfs_path().to_string_lossy().into_owned(),
+                    pci_path: dev.pci_path().to_vec(),
                 }
             })
             .collect();
@@ -431,6 +434,7 @@ impl Vmm {
         // is started.
         VmmConfig {
             balloon,
+            numa: self.vm.as_kvm().and_then(|vm| vm.common.numa.clone()),
             drives: block,
             boot_source: self.boot_source_config.clone(),
             cpu_config: None,

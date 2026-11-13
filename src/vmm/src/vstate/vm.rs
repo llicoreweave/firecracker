@@ -63,6 +63,8 @@ pub struct RoutingEntry {
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
+    /// Private NUMA placement for cold boots only.
+    pub numa: Option<crate::numa::NumaConfig>,
     /// The KVM file descriptor used to access this KvmVm.
     pub fd: VmFd,
     max_memslots: u32,
@@ -184,6 +186,7 @@ impl KvmVm {
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
         Ok(VmCommon {
+            numa: None,
             fd,
             max_memslots: kvm.max_nr_memslots(),
             guest_memory: GuestMemoryMmap::default(),

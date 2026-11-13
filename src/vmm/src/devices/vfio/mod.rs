@@ -20,11 +20,13 @@
 pub mod generated;
 mod interrupts;
 pub mod pci;
+pub mod peer_dma;
 pub mod sys;
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kvm_bindings::{
     KVM_DEV_VFIO_FILE, KVM_DEV_VFIO_FILE_ADD, kvm_create_device, kvm_device_attr,
@@ -116,7 +118,7 @@ pub struct VfioContext {
     /// handle non-coherent DMA correctly (e.g. to honour guest `WBINVD`).
     _kvm_device: DeviceFd,
     /// The container: a single IOMMU address space holding the guest memory mappings.
-    _container: Container,
+    _container: Arc<Container>,
     /// The groups attached to the container, by IOMMU group number.
     groups: BTreeMap<u32, Group>,
 }
@@ -133,6 +135,15 @@ impl VfioContext {
     /// device in its IOMMU group (bridges excepted), otherwise the kernel reports the group as not
     /// viable.
     pub fn new(vm: &KvmVm, sysfs_paths: &[&Path]) -> Result<(Self, Vec<OpenedDevice>), VfioError> {
+        Self::new_backend(vm, sysfs_paths, false)
+    }
+
+    /// Use IOMMUFD's VFIO compatibility API for explicit peer BAR mappings.
+    pub fn new_backend(
+        vm: &KvmVm,
+        sysfs_paths: &[&Path],
+        peer_dma: bool,
+    ) -> Result<(Self, Vec<OpenedDevice>), VfioError> {
         let locations = sysfs_paths
             .iter()
             .map(|path| DeviceLocation::from_sysfs(path))
@@ -156,7 +167,14 @@ impl VfioContext {
             .create_device(&mut kvm_device_config)
             .map_err(VfioError::CreateKvmDevice)?;
 
-        let container = Container::open().map_err(VfioError::Container)?;
+        let container = Arc::new(
+            if peer_dma {
+                Container::open_at("/dev/iommu")
+            } else {
+                Container::open()
+            }
+            .map_err(VfioError::Container)?,
+        );
 
         // Attach every group before selecting the IOMMU backend, so that `VFIO_SET_IOMMU` binds
         // them all to the IOMMU domain at once and `VFIO_IOMMU_GET_INFO` reports the IOVA ranges
@@ -215,6 +233,11 @@ impl VfioContext {
         context.reset_devices(&devices);
 
         Ok((context, devices))
+    }
+
+    /// Borrow the IOAS owner; it outlives all VFIO devices.
+    pub fn container(&self) -> Arc<Container> {
+        self._container.clone()
     }
 
     /// Map all of guest memory into the container's IOMMU address space, with I/O virtual

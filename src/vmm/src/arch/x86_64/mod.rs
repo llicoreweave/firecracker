@@ -303,6 +303,7 @@ pub fn configure_system_for_boot(
         device_manager,
         &mut vm.resource_allocator(),
         vcpus,
+        vm.common.numa.as_ref(),
     )?;
     Ok(())
 }

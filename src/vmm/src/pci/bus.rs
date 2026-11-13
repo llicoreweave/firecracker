@@ -5,6 +5,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Barrier, Mutex};
 
@@ -79,6 +80,8 @@ impl PciDevice for PciHostBridge {
 pub struct PciBus {
     /// Devices attached to this bus. Slot 0 is reserved for host bridge.
     devices: [Option<Arc<Mutex<dyn PciDevice>>>; NUM_DEVICE_IDS],
+    /// Cold-boot secondary buses, owned by the primary bus.
+    pub secondary: BTreeMap<u8, Arc<Mutex<PciBus>>>,
 }
 
 impl Debug for PciBus {
@@ -91,6 +94,20 @@ impl Debug for PciBus {
 }
 
 impl PciBus {
+    /// Resolve a device without retaining the primary-bus lock during its access.
+    pub fn device_on_bus(&self, bus: u8, slot: u8) -> Option<Arc<Mutex<dyn PciDevice>>> {
+        if bus == 0 {
+            self.devices.get(usize::from(slot))?.clone()
+        } else {
+            self.secondary
+                .get(&bus)?
+                .lock()
+                .unwrap()
+                .devices
+                .get(usize::from(slot))?
+                .clone()
+        }
+    }
     /// Create a new PCI bus
     pub fn new(host_bridge: PciHostBridge) -> Self {
         let mut bus: Self = Default::default();
@@ -171,11 +188,6 @@ impl PciConfigIo {
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
-
         // Don't support multi-function devices.
         if function > 0 {
             return 0xffff_ffff;
@@ -184,8 +196,8 @@ impl PciConfigIo {
         // NOTE: Potential contention among vCPU threads on this lock. This should not
         // be a problem currently, since we mainly access this when we are setting up devices.
         // We might want to do some profiling to ensure this does not become a bottleneck.
-        let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.get_device(device) {
+        let found = self.pci_bus.lock().unwrap().device_on_bus(bus, device);
+        if let Some(d) = found {
             d.lock().unwrap().read_config_register(register)
         } else {
             0xffff_ffff
@@ -208,11 +220,6 @@ impl PciConfigIo {
         let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
-            return None;
-        }
-
         // Don't support multi-function devices.
         if function > 0 {
             return None;
@@ -221,8 +228,8 @@ impl PciConfigIo {
         // NOTE: Potential contention among vCPU threads on this lock. This should not
         // be a problem currently, since we mainly access this when we are setting up devices.
         // We might want to do some profiling to ensure this does not become a bottleneck.
-        let pci_bus = self.pci_bus.as_ref().lock().unwrap();
-        if let Some(d) = pci_bus.get_device(device) {
+        let found = self.pci_bus.lock().unwrap().device_on_bus(bus, device);
+        if let Some(d) = found {
             let mut device = d.lock().unwrap();
 
             // offset is validated to be < 4 at the top of this function.
@@ -308,18 +315,13 @@ impl PciConfigMmio {
     fn config_space_read(&self, config_address: u32) -> u32 {
         let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
-        // Only support one bus.
-        if bus != 0 {
-            return 0xffff_ffff;
-        }
-
         // Don't support multi-function devices.
         if function > 0 {
             return 0xffff_ffff;
         }
 
-        let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.get_device(device) {
+        let found = self.pci_bus.lock().unwrap().device_on_bus(bus, device);
+        if let Some(d) = found {
             d.lock().unwrap().read_config_register(register)
         } else {
             0xffff_ffff
@@ -333,18 +335,13 @@ impl PciConfigMmio {
 
         let (bus, device, function, register) = parse_mmio_config_address(config_address);
 
-        // Only support one bus.
-        if bus != 0 {
-            return;
-        }
-
         // Don't support multi-function devices.
         if function > 0 {
             return;
         }
 
-        let pci_bus = self.pci_bus.lock().unwrap();
-        if let Some(d) = pci_bus.get_device(device) {
+        let found = self.pci_bus.lock().unwrap().device_on_bus(bus, device);
+        if let Some(d) = found {
             let mut device = d.lock().unwrap();
 
             // offset is validated to be < 4 at the top of this function.

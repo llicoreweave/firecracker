@@ -10,7 +10,7 @@ use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpu
 pub const DEFAULT_MEM_SIZE_MIB: usize = 128;
 /// Firecracker aims to support small scale workloads only, so limit the maximum
 /// vCPUs supported.
-pub const MAX_SUPPORTED_VCPUS: u8 = 32;
+pub const MAX_SUPPORTED_VCPUS: u8 = 64;
 
 /// Errors associated with configuring the microVM.
 #[rustfmt::skip]

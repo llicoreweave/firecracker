@@ -2,5 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod pci_segment;
+pub mod static_topology;
 
 pub use pci_segment::*;

@@ -104,6 +104,8 @@ pub enum JailerError {
     MknodDev(io::Error, String),
     #[error("Failed to set up VFIO passthrough device: {0}")]
     VfioDevice(String),
+    #[error("Failed to prepare NUMA topology metadata: {0}")]
+    NumaTopology(String),
     #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
     #[error("Failed to change the propagation type to slave: {0}")]
@@ -240,6 +242,12 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                      /dev/vfio/vfio and /dev/vfio/<group> nodes are created inside the chroot. \
                      May be specified multiple times.",
                 ),
+        )
+        .arg(
+            Argument::new("numa-node")
+                .takes_value(true)
+                .allow_multiple(true)
+                .help("Host NUMA node whose CPU membership is copied into the jail. Repeat for each configured NUMA node; assigned VFIO devices also receive their NUMA IDs."),
         )
         .arg(
             Argument::new("version")

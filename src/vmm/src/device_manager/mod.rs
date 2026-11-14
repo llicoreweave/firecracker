@@ -118,6 +118,8 @@ pub enum AttachDeviceError {
     EnclaveTransport(#[from] nitro_enclave::NeDeviceError),
     /// Operation not supported on this VM type
     NotSupported,
+    /// VFIO passthrough requires the PCIe transport to be enabled (--enable-pci)
+    PciNotEnabled,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -266,7 +268,10 @@ impl DeviceManager {
         pcie_hotplug_ports: u8,
     ) -> Result<VirtioDevices, PciManagerError> {
         if pci_enabled {
-            Ok(VirtioDevices::Pci(PciDevices::new(vm, pcie_hotplug_ports)?))
+            Ok(VirtioDevices::Pci(Box::new(PciDevices::new(
+                vm,
+                pcie_hotplug_ports,
+            )?)))
         } else {
             Ok(VirtioDevices::Mmio(MMIOVirtioDevices::new()))
         }
@@ -307,6 +312,26 @@ impl DeviceManager {
             // Unreachable in practice: enclave VMs fail the as_kvm() check above.
             VirtioDevices::Enclave(_) => Err(AttachDeviceError::NotSupported),
         }
+    }
+
+    /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
+    pub(crate) fn attach_vfio_devices(
+        &mut self,
+        vm: &Vm,
+        configs: &[(String, &std::path::Path)],
+    ) -> Result<(), AttachDeviceError> {
+        if configs.is_empty() {
+            return Ok(());
+        }
+        let kvm_vm = vm
+            .as_kvm()
+            .cloned()
+            .ok_or(AttachDeviceError::NotSupported)?;
+        let VirtioDevices::Pci(pci_devices) = &mut self.virtio_devices else {
+            return Err(AttachDeviceError::PciNotEnabled);
+        };
+        pci_devices.attach_vfio_devices(&kvm_vm, configs)?;
+        Ok(())
     }
 
     /// Attaches a [`BootTimer`] to the VM
@@ -357,6 +382,7 @@ impl DeviceManager {
         }
     }
 
+    /// The PCI devices, when the PCI transport is enabled.
     pub(crate) fn pci_devices(&self) -> Option<&PciDevices> {
         match &self.virtio_devices {
             VirtioDevices::Pci(pci_devices) => Some(pci_devices),
@@ -737,7 +763,7 @@ impl DeviceManager {
 #[derive(Debug)]
 pub enum VirtioDevices {
     Mmio(MMIOVirtioDevices),
-    Pci(PciDevices),
+    Pci(Box<PciDevices>),
     Enclave(NeDevices),
 }
 
@@ -923,7 +949,7 @@ impl<'a> Persist<'a> for DeviceManager {
                 };
                 let pci_devices = PciDevices::restore(pci_ctor_args, pci_state)
                     .map_err(DeviceManagerPersistError::PciRestore)?;
-                VirtioDevices::Pci(pci_devices)
+                VirtioDevices::Pci(Box::new(pci_devices))
             }
             VirtioDevicesState::Mmio(mmio_state) => {
                 let mmio_ctor_args = MMIODevManagerConstructorArgs {
@@ -1006,7 +1032,7 @@ pub(crate) mod tests {
     ) -> DeviceManager {
         let mut device_manager = default_device_manager();
         device_manager.virtio_devices =
-            VirtioDevices::Pci(PciDevices::new(vm, hotplug_ports).unwrap());
+            VirtioDevices::Pci(Box::new(PciDevices::new(vm, hotplug_ports).unwrap()));
         device_manager
     }
 

@@ -238,6 +238,8 @@ def validate_fc_metrics(metrics):
             "vsock_fails",
             "pmem_count",
             "pmem_fails",
+            "vfio_count",
+            "vfio_fails",
             "serial_count",
             "serial_fails",
             "hotplug_memory_count",

@@ -180,7 +180,7 @@ host); nothing else of the host sysfs is exposed.
   the new range is free and lies in a device MMIO window that can hold the BAR
   (see below). Otherwise the BAR keeps its address, and its register reads that
   address back.
-- Each BAR is naturally aligned. The 64-bit prefetchable BARs share the 256 GiB
+- Each BAR is naturally aligned. The 64-bit prefetchable BARs share the 2 TiB
   64-bit MMIO window, which the guest sees as prefetchable, and the guest can
   also move them to the 32-bit MMIO window. The other BARs, 64-bit
   non-prefetchable ones included, and the expansion ROM share the 32-bit MMIO

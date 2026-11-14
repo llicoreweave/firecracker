@@ -7,14 +7,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::arch::MAX_GUEST_MEM_SIZE;
 use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpuTemplate};
-use crate::pci::bus::MAX_PCI_BUSES;
 use crate::utils::checked_mib_to_bytes;
 
 /// The default memory size of the VM, in MiB.
 pub const DEFAULT_MEM_SIZE_MIB: usize = 128;
 /// The maximum number of PCIe hot-plug ports. Each port starts a secondary bus,
 /// and the root bus takes one of the bus numbers.
-pub const MAX_PCIE_HOTPLUG_PORTS: u8 = MAX_PCI_BUSES - 1;
+pub const MAX_PCIE_HOTPLUG_PORTS: u8 = 31;
 
 /// Errors associated with configuring the microVM.
 #[rustfmt::skip]
@@ -61,9 +60,10 @@ impl HugePageConfig {
         let divisor = match self {
             // Any integer memory size expressed in MiB will be a multiple of 4096KiB.
             HugePageConfig::None => 1,
-            // Note: THP technically supports memory not multiple of 2MB, however that disables some optimizations done
-            // by the kernel (e.g. automatic memory alignment on Linux 6.4+).
-            // To avoid performance/fragmentation surprises, having a memory multiple of 2MB is wiser.
+            // Note: THP technically supports memory not multiple of 2MB, however that disables some
+            // optimizations done by the kernel (e.g. automatic memory alignment on
+            // Linux 6.4+). To avoid performance/fragmentation surprises, having a
+            // memory multiple of 2MB is wiser.
             HugePageConfig::Transparent => 2,
             HugePageConfig::Hugetlbfs2M => 2,
         };
@@ -80,8 +80,8 @@ impl HugePageConfig {
         }
     }
 
-    /// Returns the flags required to pass to [libc::madvise], after allocating anonymous guest memory.
-    /// Note: returning [libc::MADV_NORMAL] might skip the call to `madvise` entirely.
+    /// Returns the flags required to pass to [libc::madvise], after allocating anonymous guest
+    /// memory. Note: returning [libc::MADV_NORMAL] might skip the call to `madvise` entirely.
     pub fn madvise_flags(&self) -> libc::c_int {
         match self {
             HugePageConfig::Transparent => libc::MADV_HUGEPAGE,

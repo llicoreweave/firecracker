@@ -9,11 +9,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use serde::{Deserialize, Serialize};
 use vm_allocator::RangeInclusive;
 use vmm_sys_util::eventfd::EventFd;
-
 use zerocopy::IntoBytes;
 
 use crate::logger::{error, warn};
-use crate::pci::bus::MAX_PCI_BUSES;
 use crate::pci::configuration::{
     BAR0_REG_IDX, BarPrefetchable, Bars, PciConfiguration, PciConfigurationError,
     PciConfigurationState,
@@ -61,7 +59,8 @@ pub struct HotplugCompletion {
     pub acked_buses: AtomicU32,
 }
 
-const _: () = assert!(MAX_PCI_BUSES as u32 <= u32::BITS);
+const _: () =
+    assert!((crate::vmm_config::machine_config::MAX_PCIE_HOTPLUG_PORTS as u32) < u32::BITS);
 
 impl HotplugCompletion {
     /// Create a new completion channel.
@@ -118,8 +117,8 @@ impl PciRootPort {
     /// Create a new root port.
     ///
     /// * `sbdf` - the root port's own SBDF
-    /// * `secondary_bus` - the bus number the port starts, which it also
-    ///   advertises to the guest as its physical slot number
+    /// * `secondary_bus` - the bus number the port starts, which it also advertises to the guest as
+    ///   its physical slot number
     /// * `msix_vectors` - a single-vector MSI-X group
     /// * `msix_bar_addr` - guest-physical base address of the MSI-X BAR
     /// * `completion` - channel for reporting acknowledged graceful removals

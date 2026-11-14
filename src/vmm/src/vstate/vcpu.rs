@@ -71,6 +71,8 @@ pub struct VcpuConfig {
 /// Error type for [`Vcpu::start_threaded`].
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum StartThreadedError {
+    /// Failed to pin private NUMA vCPU thread: {0}
+    Affinity(std::io::Error),
     /// Failed to spawn vCPU thread: {0}
     Spawn(std::io::Error),
     /// Failed to clone kvm Vcpu fd: {0}
@@ -190,9 +192,35 @@ impl Vcpu {
         let vcpu_fd = self
             .copy_kvm_vcpu_fd(vm)
             .map_err(StartThreadedError::CopyFd)?;
+        let host_cpu = vm
+            .common
+            .numa
+            .as_ref()
+            .and_then(|n| n.host_cpu(self.kvm_vcpu.index));
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let vcpu_thread = thread::Builder::new()
             .name(format!("fc_vcpu {}", self.kvm_vcpu.index))
             .spawn(move || {
+                let affinity = if let Some(cpu) = host_cpu {
+                    // SAFETY: CPU IDs were validated against CPU_SETSIZE and effective cpuset.
+                    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                    // SAFETY: cpu is below CPU_SETSIZE and set is initialized.
+                    unsafe { libc::CPU_SET(cpu as usize, &mut set) };
+                    // SAFETY: set is live and has the exact supplied size.
+                    if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) } != 0
+                    {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                };
+                let failed = affinity.is_err();
+                let _ = ready_tx.send(affinity);
+                if failed {
+                    return;
+                }
                 let filter = &*seccomp_filter;
                 self.register_kick_signal_handler();
                 // Synchronization to make sure thread local data is initialized.
@@ -200,6 +228,12 @@ impl Vcpu {
                 self.run(filter);
             })
             .map_err(StartThreadedError::Spawn)?;
+        ready_rx
+            .recv()
+            .map_err(|_| {
+                StartThreadedError::Affinity(std::io::Error::other("vCPU affinity setup exited"))
+            })?
+            .map_err(StartThreadedError::Affinity)?;
 
         Ok(VcpuHandle::new(
             event_sender,
@@ -702,6 +736,54 @@ pub(crate) mod tests {
     use crate::vstate::vm::tests::setup_vm_with_memory;
 
     struct DummyDevice;
+
+    #[test]
+    #[ignore = "requires KVM and host NUMA CPU metadata"]
+    fn test_numa_host_vcpu_affinity() {
+        use std::os::unix::thread::JoinHandleExt;
+
+        use crate::numa::{NumaConfig, NumaNode};
+        for (node, host) in crate::numa::permitted_host_nodes() {
+            let (mut vm, vcpu) = setup_vcpu(0x1000);
+            let numa = NumaConfig {
+                nodes: vec![NumaNode {
+                    host_node: node,
+                    vcpus: vec![0],
+                    host_cpus: vec![host],
+                    memory_mib: 2,
+                }],
+                distances: vec![vec![10]],
+            };
+            numa.validate_host_cpus().unwrap();
+            vm.common.numa = Some(numa);
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handle = vcpu
+                .start_threaded(
+                    &vm,
+                    get_empty_filters().remove("vcpu").unwrap(),
+                    barrier.clone(),
+                )
+                .unwrap();
+            barrier.wait();
+            // SAFETY: zero initializes a cpu_set_t.
+            let mut cpus: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            let thread = handle.vcpu_thread.as_ref().unwrap().as_pthread_t();
+            assert_eq!(
+                // SAFETY: thread is live and cpus is writable for the supplied size.
+                unsafe {
+                    libc::pthread_getaffinity_np(thread, std::mem::size_of_val(&cpus), &mut cpus)
+                },
+                0
+            );
+            // SAFETY: cpus was populated by pthread_getaffinity_np.
+            assert_eq!(unsafe { libc::CPU_COUNT(&cpus) }, 1);
+            // SAFETY: host is below CPU_SETSIZE.
+            assert!(unsafe { libc::CPU_ISSET(host as usize, &cpus) });
+            eprintln!("vCPU 0 pinned to host CPU {host} on node {node}");
+            handle.send_event(VcpuEvent::Finish).unwrap();
+            drop(handle);
+        }
+    }
 
     impl BusDevice for DummyDevice {
         fn read(&mut self, _base: u64, _offset: u64, _data: &mut [u8]) {}

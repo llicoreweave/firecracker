@@ -52,7 +52,7 @@ use crate::{DirtyBitmap, Vcpu, mem_size_mib};
 /// 64 cores; CPUID leaf 0x1 EBX[23:16] rejects counts above 128; and the MP table and ACPI MADT
 /// both identify a CPU by an 8-bit APIC ID. On aarch64 none of these exist, and the bound is the
 /// kernel VGIC, at 512 vCPUs.
-pub const MAX_SUPPORTED_KVM_VCPUS: u16 = 32;
+pub const MAX_SUPPORTED_KVM_VCPUS: u16 = 64;
 
 /// The KVM vCPU plumbing narrows the count to a `u8`, so the limit must fit in
 /// one for that narrowing to be infallible.
@@ -77,6 +77,8 @@ pub struct RoutingEntry {
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
+    /// Private NUMA placement for cold boots only.
+    pub numa: Option<crate::numa::NumaConfig>,
     /// The KVM file descriptor used to access this KvmVm.
     pub fd: VmFd,
     max_memslots: u32,
@@ -211,6 +213,7 @@ impl KvmVm {
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
         Ok(VmCommon {
+            numa: None,
             fd,
             max_memslots: kvm.max_nr_memslots(),
             guest_memory: GuestMemoryMmap::default(),
@@ -1155,7 +1158,8 @@ pub(crate) mod tests {
             vector_ctl: 0x0, // un-masked
             ..configs[1].clone()
         };
-        // `update` and `register` will update the in-memory GSI config of its route (and only its route)
+        // `update` and `register` will update the in-memory GSI config of its route (and only its
+        // route)
         msix_group.update(0, &unmasked0, pci_sbdf).unwrap();
         msix_group.register(1, &unmasked1, pci_sbdf).unwrap();
         for i in 0..4 {

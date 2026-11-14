@@ -171,6 +171,8 @@ pub enum CreateSnapshotError {
     SnapshotBackingFile(&'static str, io::Error),
     /// Snapshotting a microVM with a VFIO passthrough device attached is not supported
     VfioNotSupported,
+    /// Snapshotting a NUMA microVM is not supported
+    NumaNotSupported,
 }
 
 /// Snapshot version
@@ -182,6 +184,9 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    if vmm.vm.as_kvm().is_some_and(|vm| vm.common.numa.is_some()) {
+        return Err(CreateSnapshotError::NumaNotSupported);
+    }
     // The internal state of a physically assigned (VFIO passthrough) device lives in the hardware
     // and cannot be captured, so reject snapshots while any such device is attached rather than
     // silently producing an unrestorable snapshot.

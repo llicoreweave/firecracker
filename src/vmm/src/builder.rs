@@ -242,6 +242,7 @@ pub fn build_microvm_for_boot(
         )?;
         *vm.resource_allocator() = allocator;
     }
+    vm.common.numa = vm_resources.numa.clone();
     let mut vcpus = vm.create_vcpus(vcpu_count)?;
     vm.register_dram_memory_regions(guest_memory)?;
 

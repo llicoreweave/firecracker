@@ -39,6 +39,7 @@ class JailerContext:
     cgroup_ver = None
     parent_cgroup = None
     vfio_devices = None
+    numa_nodes = None
 
     def __init__(
         self,
@@ -55,6 +56,7 @@ class JailerContext:
         cgroup_ver=None,
         parent_cgroup=None,
         vfio_devices=None,
+        numa_nodes=None,
         **extra_args,
     ):
         """Set up jailer fields.
@@ -79,6 +81,7 @@ class JailerContext:
         self.cgroup_ver = cgroup_ver
         self.parent_cgroup = parent_cgroup
         self.vfio_devices = vfio_devices or []
+        self.numa_nodes = numa_nodes or []
         assert chroot_base is not None
 
     # Disabling 'too-many-branches' warning for this function as it needs to
@@ -123,6 +126,8 @@ class JailerContext:
                 jailer_param_list.extend(["--resource-limit", str(limit)])
         for vfio_device in self.vfio_devices:
             jailer_param_list.extend(["--vfio-device", str(vfio_device)])
+        for node in self.numa_nodes:
+            jailer_param_list.extend(["--numa-node", str(node)])
         # applying necessary extra args if needed
         if len(self.extra_args) > 0:
             jailer_param_list.append("--")

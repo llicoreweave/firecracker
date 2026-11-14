@@ -34,11 +34,31 @@ pub mod generated;
 use std::cmp::max;
 use std::fs::File;
 
+use kvm::Kvm;
+use layout::{
+    CMDLINE_START, MMIO32_MEM_SIZE, MMIO32_MEM_START, MMIO64_MEM_SIZE, MMIO64_MEM_START,
+    PCI_MMCONFIG_SIZE, PCI_MMCONFIG_START,
+};
+use linux_loader::configurator::linux::LinuxBootConfigurator;
+use linux_loader::configurator::pvh::PvhBootConfigurator;
+use linux_loader::configurator::{BootConfigurator, BootParams};
+use linux_loader::loader::bootparam::{XLF_KERNEL_64, boot_params, setup_header};
+use linux_loader::loader::bzimage::BzImage as BzImageLoader;
+use linux_loader::loader::elf::start_info::{
+    hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
+};
+use linux_loader::loader::elf::{Elf as ElfLoader, Error as ElfError};
+use linux_loader::loader::{
+    Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
+};
+use vm_memory::GuestMemoryBackend;
+
 use super::EntryPoint;
 use crate::acpi::create_acpi_tables;
 use crate::arch::{BootProtocol, SYSTEM_MEM_SIZE, SYSTEM_MEM_START, arch_memory_regions_with_gap};
 use crate::cpu_config::templates::{CustomCpuTemplate, GuestConfigError};
-use crate::cpu_config::x86_64::{apply_template_to_cpuid, apply_template_to_msrs, cpuid::Cpuid};
+use crate::cpu_config::x86_64::cpuid::Cpuid;
+use crate::cpu_config::x86_64::{apply_template_to_cpuid, apply_template_to_msrs};
 use crate::device_manager::DeviceManager;
 use crate::device_manager::pci_mngr::PciDevices;
 use crate::initrd::InitrdConfig;
@@ -50,25 +70,6 @@ use crate::vstate::memory::{
 use crate::vstate::vcpu::KvmVcpuConfigureError;
 use crate::vstate::vm::KvmVm;
 use crate::{Vcpu, align_down};
-use kvm::Kvm;
-use layout::{
-    CMDLINE_START, MMIO32_MEM_SIZE, MMIO32_MEM_START, MMIO64_MEM_SIZE, MMIO64_MEM_START,
-    PCI_MMCONFIG_SIZE, PCI_MMCONFIG_START,
-};
-use linux_loader::configurator::linux::LinuxBootConfigurator;
-use linux_loader::configurator::pvh::PvhBootConfigurator;
-use linux_loader::configurator::{BootConfigurator, BootParams};
-use linux_loader::loader::bootparam::{XLF_KERNEL_64, boot_params, setup_header};
-use linux_loader::loader::bzimage::BzImage as BzImageLoader;
-use linux_loader::loader::elf::Elf as ElfLoader;
-use linux_loader::loader::elf::Error as ElfError;
-use linux_loader::loader::elf::start_info::{
-    hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
-};
-use linux_loader::loader::{
-    Cmdline, Error as KernelLoaderError, KernelLoader, PvhBootCapability, load_cmdline,
-};
-use vm_memory::GuestMemoryBackend;
 
 // Value taken from https://elixir.bootlin.com/linux/v5.10.68/source/arch/x86/include/uapi/asm/e820.h#L31
 // Usable normal RAM
@@ -326,6 +327,7 @@ pub fn configure_system_for_boot(
         device_manager,
         &mut vm.resource_allocator(),
         vcpus,
+        vm.common.numa.as_ref(),
     )?;
     Ok(())
 }

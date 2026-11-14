@@ -421,6 +421,13 @@ impl Env {
         let (major, minor) = Self::host_dev_numbers(&container)?;
         nodes.push((container, major, minor));
 
+        // Expose IOMMUFD's VFIO compatibility backend for peer BAR mappings.
+        let iommu = PathBuf::from("/dev/iommu");
+        if iommu.exists() {
+            let (major, minor) = Self::host_dev_numbers(&iommu)?;
+            nodes.push((iommu, major, minor));
+        }
+
         let mut seen_groups = std::collections::HashSet::new();
         for (sysfs_path, group_target) in iommu_group_links {
             let group = group_target

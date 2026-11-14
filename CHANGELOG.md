@@ -10,6 +10,8 @@ and this project adheres to
 
 ### Added
 
+- IOMMUFD/VFIO DMA-BUF peer BAR mappings for static PCI passthrough.
+
 - Explicit x86_64 KVM NUMA configuration with vCPU affinity, memory binding,
   ACPI SRAT/SLIT and caller-configured PCI roots, bridges, bus numbers and
   endpoint addresses. PCI root `_PXM` uses the supplied guest NUMA domain.

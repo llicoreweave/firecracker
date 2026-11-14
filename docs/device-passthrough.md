@@ -86,11 +86,11 @@ The current static topology mode requires x86_64 KVM.
 }
 ```
 
-Merge this fragment with the boot source, machine and drive configuration.
-The endpoint appears at `0000:00:10.0` in the guest. For multiple roots,
-bridges and optional NUMA affinity, see [PCI topology](pci-numa.md).
-The preboot `/vfio/{id}` API only describes an endpoint; it does not supply
-its required PCI graph. Use the configuration file to boot passthrough VMs.
+Merge this fragment with the boot source, machine and drive configuration. The
+endpoint appears at `0000:00:10.0` in the guest. For multiple roots, bridges and
+optional NUMA affinity, see [PCI topology](pci-numa.md). The preboot
+`/vfio/{id}` API only describes an endpoint; it does not supply its required PCI
+graph. Use the configuration file to boot passthrough VMs.
 
 ### Running with the jailer
 
@@ -159,9 +159,9 @@ host); nothing else of the host sysfs is exposed.
 
 ## Limitations
 
-- Static passthrough requires x86_64 KVM, `--enable-pci` and a configured
-  PCI graph. Devices can only be configured before
-  boot: hot-plugging and hot-unplugging are not supported.
+- Static passthrough requires x86_64 KVM, `--enable-pci` and a configured PCI
+  graph. Devices can only be configured before boot: hot-plugging and
+  hot-unplugging are not supported.
 - A microVM with a passthrough device cannot be
   [snapshotted](snapshotting/snapshot-support.md): the device state lives in the
   hardware and cannot be saved.
@@ -180,7 +180,8 @@ host); nothing else of the host sysfs is exposed.
   expansion ROM BAR takes effect when the BAR next starts decoding memory, if
   the new range is free and lies in a device MMIO window that can hold the BAR
   (see below). Otherwise the BAR keeps its address, and its register reads that
-  address back.
+  address back. Bridged passthrough with peer DMA preserves its initially
+  assigned BAR addresses and rejects relocation to keep peer IOVAs stable.
 - Each BAR is naturally aligned. The 64-bit prefetchable BARs share the 2 TiB
   64-bit MMIO window, which the guest sees as prefetchable, and the guest can
   also move them to the 32-bit MMIO window. The other BARs, 64-bit

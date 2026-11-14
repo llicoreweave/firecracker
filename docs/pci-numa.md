@@ -1,9 +1,9 @@
 # PCI passthrough with NUMA locality
 
-Start Firecracker with `--enable-pci --config-file <file>`. The caller owns
-all topology policy. Firecracker consumes explicit guest PCI roots, bridges,
-port types, bus registers, endpoint BDFs and root NUMA affinity. It never reads
-host PCI ancestry or locality to choose any of these settings.
+Start Firecracker with `--enable-pci --config-file <file>`. The caller owns all
+topology policy. Firecracker consumes explicit guest PCI roots, bridges, port
+types, bus registers, endpoint BDFs and root NUMA affinity. It never reads host
+PCI ancestry or locality to choose any of these settings.
 
 ```json
 {
@@ -36,16 +36,16 @@ Merge this fragment with the VM's boot source, drives and other configuration.
 The generator must supply actual host CPU IDs and distances and allocate devices
 exclusively, already bound to `vfio-pci`. Guest bus numbers can differ from host
 BDFs. In this example the guest endpoints are `0000:07:00.0` and `0000:19:00.0`.
-Sparse bus ranges and multiple PCI roots with the same NUMA affinity are allowed;
-reordering roots or changing affinity never renumbers any device.
+Sparse bus ranges and multiple PCI roots with the same NUMA affinity are
+allowed; reordering roots or changing affinity never renumbers any device.
 
 `roots[].numa_node` is the guest domain index in `numa.nodes`, not `host_node`.
 The VMM emits it directly as the ACPI PCI root's `_PXM`. When omitted, that root
 has no `_PXM`. Root identity and `_BBN` come from its configured bus number.
 [NUMA configuration](numa.md) and ACPI SRAT/SLIT describe the independently
-configured CPU/memory domains. Linux
-derives subordinate endpoint locality through its PCI root bridge; a root-port
-`_PXM` alone does not establish endpoint locality on x86 Linux.
+configured CPU/memory domains. Linux derives subordinate endpoint locality
+through its PCI root bridge; a root-port `_PXM` alone does not establish
+endpoint locality on x86 Linux.
 
 Every bridge explicitly supplies its guest address (including primary bus),
 secondary bus, subordinate bus and PCIe port type. No missing bridge or endpoint
@@ -57,26 +57,33 @@ supplies an explicit root and endpoint addresses, with `bridges: []`.
 The VMM still probes device BAR requirements and allocates MMIO resources within
 the configured graph, including disjoint ACPI root windows and 1-MiB bridge
 window granularity. This resource allocation does not choose PCI connections,
-bus numbers, port types or locality. The x86 MMIO64 aperture spans 2 TiB starting
-at 2 TiB; exhaustion fails startup. CF8/CFC and ECAM both decode secondary buses.
+bus numbers, port types or locality. The x86 MMIO64 aperture spans 2 TiB
+starting at 2 TiB; exhaustion fails startup. CF8/CFC and ECAM both decode
+secondary buses.
 
 For jailed VMs, pass `--numa-node <host-id>` for each configured host node,
-alongside assigned `--vfio-device` arguments. The runtime must supply these explicitly.
-The jailer supplies only selected CPU membership for CPU-affinity validation;
-it no longer copies device `numa_node` files. Host sysfs stays outside the jail.
+alongside assigned `--vfio-device` arguments. The runtime must supply these
+explicitly. The jailer supplies only selected CPU membership for CPU-affinity
+validation; it no longer copies device `numa_node` files. Host sysfs stays
+outside the jail.
 
 RAM ranges split at NUMA boundaries without counting PCI holes as RAM. Each
 mapping receives `MPOL_BIND` before first touch and VFIO pinning. Each vCPU
 thread pins to its corresponding host CPU before entering KVM. CPU locality,
-effective affinity, RAM totals, and the explicit PCI graph are
-validated. Host CPU pinning does not reserve those CPUs exclusively.
+effective affinity, RAM totals, and the explicit PCI graph are validated. Host
+CPU pinning does not reserve those CPUs exclusively.
+
+The static passthrough mode supports IOMMUFD/VFIO DMA-BUF BAR export/import for
+peer DMA, without disabling the host IOMMU or ACS. This requires compatible host
+VFIO/IOMMUFD support and guest GPU/RDMA drivers. A successful VM boot alone does
+not establish successful GPU peer DMA.
 
 ## Runtime integration
 
 A container runtime or another topology generator must produce the complete
-configuration before launching Firecracker. It chooses device ownership,
-CPU and memory placement, PCI roots, bridge types, bus ranges and endpoint
-addresses. Firecracker validates and materializes that configuration.
+configuration before launching Firecracker. It chooses device ownership, CPU and
+memory placement, PCI roots, bridge types, bus ranges and endpoint addresses.
+Firecracker validates and materializes that configuration.
 
 The [JSON fixture](fixtures/pci-topology.json) illustrates two guest NUMA nodes,
 a PCIe switch hierarchy and three endpoints using synthetic host addresses.

@@ -10,21 +10,20 @@
 //!   a *positive* count when the kernel could only allocate part of the requested MSI/MSI-X vectors
 //!   (`drivers/vfio/pci/vfio_pci_intrs.c: vfio_msi_enable`); this is reported as
 //!   [`SetIrqsError::Partial`] rather than being mistaken for success.
-//! * Nothing here issues ioctls or touches sysfs on drop. Closing the file descriptors is enough for
-//!   the kernel to release everything in the right order: a device file holds a reference on its
-//!   group file (`drivers/vfio/group.c: vfio_group_fops_release`), a group holds a reference on its
-//!   container, and the type1 backend drops every DMA mapping when the container goes away.
+//! * Nothing here issues ioctls or touches sysfs on drop. Closing the file descriptors is enough
+//!   for the kernel to release everything in the right order: a device file holds a reference on
+//!   its group file (`drivers/vfio/group.c: vfio_group_fops_release`), a group holds a reference on
+//!   its container, and the type1 backend drops every DMA mapping when the container goes away.
 
 use std::fs::{File, OpenOptions};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 
-use vmm_sys_util::errno;
 use vmm_sys_util::ioctl::{
     ioctl, ioctl_with_mut_ptr, ioctl_with_ptr, ioctl_with_ref, ioctl_with_val,
 };
-use vmm_sys_util::ioctl_io_nr;
+use vmm_sys_util::{errno, ioctl_io_nr};
 
 use super::generated::vfio::_bindgen_ty_1::VFIO_PCI_CONFIG_REGION_INDEX;
 use super::generated::vfio::_bindgen_ty_2::VFIO_PCI_MSIX_IRQ_INDEX;
@@ -96,7 +95,8 @@ pub enum VfioSysError {
     ApiVersion(i32),
     /// The host kernel does not provide the VFIO type1v2 IOMMU backend
     NoType1v2Iommu,
-    /// IOMMU group {0} is not viable: every device in the group must be bound to vfio-pci (or to no driver)
+    /// IOMMU group {0} is not viable: every device in the group must be bound to vfio-pci (or to no
+    /// driver)
     GroupNotViable(u32),
     /// IOMMU group {0} is already attached to another VFIO container
     GroupInUse(u32),
@@ -274,11 +274,16 @@ pub struct IommuInfo {
 impl Container {
     /// Open `/dev/vfio/vfio` and check that the kernel provides the type1v2 IOMMU backend.
     pub fn open() -> Result<Self, VfioSysError> {
+        Self::open_at(VFIO_CONTAINER_PATH)
+    }
+
+    /// Open a legacy container or the compatible /dev/iommu backend.
+    pub fn open_at(path: &str) -> Result<Self, VfioSysError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(VFIO_CONTAINER_PATH)
-            .map_err(|err| VfioSysError::Open(VFIO_CONTAINER_PATH.to_string(), err))?;
+            .open(path)
+            .map_err(|err| VfioSysError::Open(path.to_string(), err))?;
         let container = Container { file };
 
         // SAFETY: `container` wraps a VFIO container fd and the request takes no argument.

@@ -394,13 +394,28 @@ impl PciDevices {
         assert!(self.vfio_context.is_none());
 
         let paths: Vec<&Path> = configs.iter().map(|&(_, path)| path).collect();
-        let (context, opened) = VfioContext::new(vm, &paths)?;
+        let (context, opened) = VfioContext::new_backend(
+            vm,
+            &paths,
+            self.topology
+                .as_ref()
+                .is_some_and(|p| !p.config.bridges.is_empty()),
+        )?;
         self.add_vfio_devices(
             vm,
             configs.iter().zip(opened).map(|((id, _), opened)| {
                 move |sbdf: PciSBDF| VfioPciDevice::new(id.clone(), sbdf, opened, vm.clone())
             }),
         )?;
+        if self
+            .topology
+            .as_ref()
+            .is_some_and(|p| !p.config.bridges.is_empty())
+        {
+            for device in self.vfio_devices.values() {
+                device.lock().unwrap().enable_peer_dma(context.container());
+            }
+        }
         self.vfio_context = Some(context);
 
         Ok(())
@@ -1269,6 +1284,15 @@ fn place_vfio_bars(
             Ok((device, requirement.slot, range.start()))
         })
         .collect()
+}
+
+impl Drop for PciDevices {
+    fn drop(&mut self) {
+        // Stop every assigned initiator before any GPU peer BAR can disappear.
+        for device in self.vfio_devices.values() {
+            device.lock().unwrap().stop_dma();
+        }
+    }
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]

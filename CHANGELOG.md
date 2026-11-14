@@ -13,6 +13,8 @@ and this project adheres to
 - Added `pci_mmio64.base_gib` and `pci_mmio64.size_gib` machine settings for the
   preboot PCI MMIO64 aperture on x86_64 and aarch64. See
   [PCI MMIO64 configuration](docs/pci-mmio64.md).
+- IOMMUFD/VFIO DMA-BUF peer BAR mappings for static PCI passthrough.
+
 - Explicit x86_64 KVM NUMA configuration with vCPU affinity, memory binding,
   ACPI SRAT/SLIT and caller-configured PCI roots, bridges, bus numbers and
   endpoint addresses. PCI root `_PXM` uses the supplied guest NUMA domain.

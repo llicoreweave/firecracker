@@ -13,6 +13,9 @@ and this project adheres to
 - Added `pci_mmio64.base_gib` and `pci_mmio64.size_gib` machine settings for the
   preboot PCI MMIO64 aperture on x86_64 and aarch64. See
   [PCI MMIO64 configuration](docs/pci-mmio64.md).
+- Explicit x86_64 KVM NUMA configuration with CPU affinity, memory binding
+  and ACPI SRAT/SLIT. See [NUMA configuration](docs/numa.md).
+
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),

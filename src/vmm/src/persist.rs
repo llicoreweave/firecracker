@@ -165,6 +165,8 @@ pub enum CreateSnapshotError {
     MicrovmState(MicrovmStateError),
     /// Cannot serialize the microVM state: {0}
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
+    /// Snapshotting a NUMA microVM is not supported
+    NumaNotSupported,
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
 }
@@ -178,6 +180,9 @@ pub fn create_snapshot(
     vm_info: &VmInfo,
     params: &CreateSnapshotParams,
 ) -> Result<(), CreateSnapshotError> {
+    if vmm.vm.as_kvm().is_some_and(|vm| vm.common.numa.is_some()) {
+        return Err(CreateSnapshotError::NumaNotSupported);
+    }
     vmm.can_snapshot(params.snapshot_type)
         .map_err(CreateSnapshotError::MicrovmState)?;
 

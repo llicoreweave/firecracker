@@ -77,6 +77,8 @@ pub struct RoutingEntry {
 /// Architecture independent parts of a VM.
 #[derive(Debug)]
 pub struct VmCommon {
+    /// Private NUMA placement for cold boots only.
+    pub numa: Option<crate::numa::NumaConfig>,
     /// The KVM file descriptor used to access this KvmVm.
     pub fd: VmFd,
     max_memslots: u32,
@@ -211,6 +213,7 @@ impl KvmVm {
         let vcpus_exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(VmError::EventFd)?;
 
         Ok(VmCommon {
+            numa: None,
             fd,
             max_memslots: kvm.max_nr_memslots(),
             guest_memory: GuestMemoryMmap::default(),
@@ -1391,7 +1394,8 @@ pub(crate) mod tests {
             vector_ctl: 0x0, // un-masked
             ..configs[1].clone()
         };
-        // `update` and `register` will update the in-memory GSI config of its route (and only its route)
+        // `update` and `register` will update the in-memory GSI config of its route (and only its
+        // route)
         msix_group.update(0, &unmasked0, pci_sbdf).unwrap();
         msix_group.register(1, &unmasked1, pci_sbdf).unwrap();
         for i in 0..4 {

@@ -38,6 +38,7 @@ class JailerContext:
     resource_limits = None
     cgroup_ver = None
     parent_cgroup = None
+    numa_nodes = None
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class JailerContext:
         resource_limits=None,
         cgroup_ver=None,
         parent_cgroup=None,
+        numa_nodes=None,
         **extra_args,
     ):
         """Set up jailer fields.
@@ -76,6 +78,7 @@ class JailerContext:
         self.resource_limits = resource_limits
         self.cgroup_ver = cgroup_ver
         self.parent_cgroup = parent_cgroup
+        self.numa_nodes = numa_nodes or []
         assert chroot_base is not None
 
     # Disabling 'too-many-branches' warning for this function as it needs to
@@ -118,6 +121,8 @@ class JailerContext:
         if self.resource_limits is not None:
             for limit in self.resource_limits:
                 jailer_param_list.extend(["--resource-limit", str(limit)])
+        for node in self.numa_nodes:
+            jailer_param_list.extend(["--numa-node", str(node)])
         # applying necessary extra args if needed
         if len(self.extra_args) > 0:
             jailer_param_list.append("--")

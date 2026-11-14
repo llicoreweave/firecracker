@@ -240,6 +240,7 @@ pub fn build_microvm_for_boot(
         )?;
         *vm.resource_allocator() = allocator;
     }
+    vm.common.numa = vm_resources.numa.clone();
     vm.register_dram_memory_regions(guest_memory)?;
 
     // Allocate memory as soon as possible to make hotpluggable memory available to all consumers,

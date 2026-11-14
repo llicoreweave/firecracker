@@ -24,6 +24,7 @@ jailer --id <id> \
        [--chroot-base-dir <chroot_base>] \
        [--netns <netns>] \
        [--resource-limit <resource=value>] \
+       [--numa-node <host_node>] \
        [--daemonize] \
        [--new-pid-ns] \
        [--...extra arguments for Firecracker]
@@ -94,6 +95,10 @@ Here is an example on how to set multiple resource limits using this argument:
 ```bash
 --resource-limit fsize=250000000 --resource-limit no-file=1024
 ```
+
+- `--numa-node` copies CPU-membership metadata for a selected host NUMA node
+  into the jail. Repeat it for every node used by the VM's explicit NUMA
+  configuration. It does not select devices or change PCI placement.
 
 - When present, `--daemonize` causes the jailer to call `setsid()` and redirect
   all three standard I/O file descriptors to `/dev/null`.

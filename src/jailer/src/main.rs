@@ -104,6 +104,8 @@ pub enum JailerError {
     MkdirOldRoot(io::Error),
     #[error("Failed to create {1} via mknod inside the jail: {0}")]
     MknodDev(io::Error, String),
+    #[error("Failed to prepare NUMA topology metadata: {0}")]
+    NumaTopology(String),
     #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
     #[error("Failed to change the propagation type to slave: {0}")]
@@ -227,6 +229,15 @@ pub fn build_arg_parser() -> ArgParser<'static> {
             Argument::new("parent-cgroup")
                 .takes_value(true)
                 .help("Parent cgroup in which the cgroup of this microvm will be placed."),
+        )
+        .arg(
+            Argument::new("numa-node")
+                .takes_value(true)
+                .allow_multiple(true)
+                .help(
+                    "Host NUMA node whose CPU membership is copied into the jail. Repeat for each \
+                     configured NUMA node.",
+                ),
         )
         .arg(
             Argument::new("version")

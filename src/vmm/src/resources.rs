@@ -42,6 +42,8 @@ use crate::vstate::memory::{GuestRegionMmap, MemfdBacking, MemoryError};
 /// Errors encountered when configuring microVM resources.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum ResourcesError {
+    /// Invalid NUMA configuration: {0}
+    Numa(String),
     /// Balloon device error: {0}
     BalloonDevice(#[from] BalloonConfigError),
     /// Block device error: {0}
@@ -99,6 +101,8 @@ pub enum CustomCpuTemplateOrPath {
 #[serde(rename_all = "kebab-case")]
 #[allow(missing_docs)]
 pub struct VmmConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numa: Option<crate::numa::NumaConfig>,
     pub balloon: Option<BalloonDeviceConfig>,
     pub drives: Vec<BlockDeviceConfig>,
     pub boot_source: BootSourceConfig,
@@ -127,6 +131,8 @@ pub struct VmmConfig {
 /// held in the Vmm.
 #[derive(Debug, Default)]
 pub struct VmResources {
+    /// Explicit cold-boot NUMA configuration.
+    pub numa: Option<crate::numa::NumaConfig>,
     /// The vCpu and memory configuration for this microVM.
     pub machine_config: MachineConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
@@ -289,6 +295,9 @@ impl VmResources {
             resources.set_enclave_config(enclave);
         }
 
+        resources.numa = vmm_config.numa;
+        resources.validate_numa().map_err(ResourcesError::Numa)?;
+
         for config in vmm_config.device_passthrough {
             resources.device_passthrough.add(config)?;
         }
@@ -296,8 +305,29 @@ impl VmResources {
         Ok(resources)
     }
 
+    /// Validate again at boot, including changes made through the preboot API.
+    pub fn validate_numa(&self) -> Result<(), String> {
+        if let Some(numa) = &self.numa {
+            if !cfg!(target_arch = "x86_64") || !self.pci_enabled {
+                return Err("NUMA requires x86_64 and --enable-pci".into());
+            }
+            numa.validate(
+                self.machine_config.vcpu_count,
+                self.machine_config.mem_size_mib,
+            )?;
+            if self.memory_hotplug.is_some() || self.balloon.get().is_some() {
+                return Err("NUMA does not support memory hotplug or ballooning".into());
+            }
+        }
+        if self.enclave.is_some() && self.numa.is_some() {
+            return Err("NUMA requires KVM".into());
+        }
+        Ok(())
+    }
+
     /// Validate the VM configuration for incompatibilities
     pub fn validate(&self) -> Result<(), ResourcesError> {
+        self.validate_numa().map_err(ResourcesError::Numa)?;
         if !self.device_passthrough.configs.is_empty() {
             self.compatible_with_passthrough_device()?;
         }
@@ -651,6 +681,8 @@ impl VmResources {
         &self,
         memfd: bool,
     ) -> Result<(Vec<GuestRegionMmap>, Option<MemfdBacking>), MemoryError> {
+        self.validate_numa()
+            .map_err(|e| MemoryError::Numa(std::io::Error::other(e)))?;
         let regions = match self.machine_config.pci_mmio64 {
             Some(config) => crate::arch::arch_memory_regions_with_mmio64(
                 mib_to_bytes(self.machine_config.mem_size_mib),
@@ -661,6 +693,27 @@ impl VmResources {
                 crate::arch::arch_memory_regions(mib_to_bytes(self.machine_config.mem_size_mib))
             }
         }?;
+
+        if let Some(numa) = &self.numa {
+            if memfd {
+                return Err(MemoryError::Numa(std::io::Error::other(
+                    "NUMA memfd/snapshot not supported",
+                )));
+            }
+            numa.validate_host_cpus().map_err(MemoryError::Numa)?;
+            let layout = numa
+                .regions(&regions)
+                .map_err(|e| MemoryError::Numa(std::io::Error::other(e)))?;
+            let ranges: Vec<_> = layout.iter().map(|&(addr, size, _)| (addr, size)).collect();
+            let guest_memory = memory::anonymous(
+                &ranges,
+                self.machine_config.track_dirty_pages,
+                self.machine_config.huge_pages,
+            )?;
+            numa.bind_memory(&guest_memory, &layout)?;
+            return Ok((guest_memory, None));
+        }
+
         if memfd {
             let mut backing = MemfdBacking::new(
                 self.guest_memory_size(&regions)?,
@@ -734,6 +787,7 @@ impl From<&VmResources> for VmmConfig {
             memory_hotplug: resources.memory_hotplug.clone(),
             enclave: resources.enclave.clone(),
             device_passthrough: resources.device_passthrough.configs.clone(),
+            numa: resources.numa.clone(),
         }
     }
 }
@@ -905,6 +959,7 @@ mod tests {
 
     fn default_vm_resources() -> VmResources {
         VmResources {
+            numa: None,
             machine_config: MachineConfig::default(),
             boot_source: default_boot_cfg(),
             block: default_blocks(),

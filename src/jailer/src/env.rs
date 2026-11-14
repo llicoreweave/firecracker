@@ -137,6 +137,48 @@ pub struct Env {
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
     ne_dev_minor: Option<u32>,
+    numa_metadata: NumaMetadata,
+}
+
+/// A snapshot of selected host topology facts, without mounting host sysfs.
+#[derive(Debug, Default)]
+struct NumaMetadata {
+    directories: Vec<PathBuf>,
+}
+
+impl NumaMetadata {
+    fn resolve(sysfs: &Path, nodes: &[String]) -> Result<Self, JailerError> {
+        let mut metadata = Self::default();
+        if nodes.is_empty() {
+            return Ok(metadata);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in nodes {
+            let node =
+                raw.parse::<u32>().ok().filter(|n| *n < 64).ok_or_else(|| {
+                    JailerError::NumaTopology(format!("invalid host node {raw:?}"))
+                })?;
+            if !seen.insert(node) {
+                continue;
+            }
+            let relative = format!("devices/system/node/node{node}");
+            let destination = Path::new("/sys").join(&relative);
+            let entries = fs::read_dir(sysfs.join(&relative))
+                .map_err(|e| JailerError::NumaTopology(format!("reading node {node}: {e}")))?;
+            metadata.directories.push(destination.clone());
+            for entry in entries {
+                let entry = entry.map_err(|e| JailerError::NumaTopology(e.to_string()))?;
+                let name = entry.file_name();
+                let name = name.to_str().unwrap_or_default();
+                if name.strip_prefix("cpu").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+                }) {
+                    metadata.directories.push(destination.join(name));
+                }
+            }
+        }
+        Ok(metadata)
+    }
 }
 
 /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
@@ -283,6 +325,10 @@ impl Env {
         let uffd_dev_minor = Self::get_misc_dev_minor_number("userfaultfd").ok();
         let ne_dev_minor = Self::get_misc_dev_minor_number("nitro_enclaves").ok();
 
+        let numa_metadata = NumaMetadata::resolve(
+            Path::new("/sys"),
+            arguments.multiple_values("numa-node").unwrap_or_default(),
+        )?;
         Ok(Env {
             id: id.to_owned(),
             chroot_dir,
@@ -300,6 +346,7 @@ impl Env {
             resource_limits,
             uffd_dev_minor,
             ne_dev_minor,
+            numa_metadata,
         })
     }
 
@@ -727,6 +774,12 @@ impl Env {
             self.mknod_and_own_dev(DEV_NE_PATH, DEV_NE_MAJOR, minor)?;
         }
 
+        // These are inert metadata copies captured before chroot, not host
+        // sysfs mounts. Only explicitly requested NUMA nodes are represented.
+        for directory in &self.numa_metadata.directories {
+            self.setup_jailed_folder(directory)?;
+        }
+
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
         // Daemonize before exec, if so required (when the dev_null variable != None).
@@ -806,6 +859,32 @@ mod tests {
     use super::*;
     use crate::build_arg_parser;
     use crate::cgroup::test_util::MockCgroupFs;
+
+    #[test]
+    fn test_numa_metadata_is_scoped_and_opt_in() {
+        let root = TempDir::new().unwrap();
+        let node = root.as_path().join("devices/system/node/node0");
+        fs::create_dir_all(node.join("cpu0")).unwrap();
+        fs::create_dir_all(node.join("cpu2")).unwrap();
+        fs::create_dir_all(node.join("memory0")).unwrap();
+        fs::write(node.join("cpulist"), "0,2\n").unwrap();
+        let empty = NumaMetadata::resolve(root.as_path(), &[]).unwrap();
+        assert!(empty.directories.is_empty());
+        let metadata = NumaMetadata::resolve(root.as_path(), &["0".into(), "0".into()]).unwrap();
+        let mut actual = metadata.directories;
+        actual.sort();
+        assert_eq!(
+            actual,
+            vec![
+                PathBuf::from("/sys/devices/system/node/node0"),
+                PathBuf::from("/sys/devices/system/node/node0/cpu0"),
+                PathBuf::from("/sys/devices/system/node/node0/cpu2")
+            ]
+        );
+        for invalid in ["64", "-1", "../0", "garbage"] {
+            NumaMetadata::resolve(root.as_path(), &[invalid.into()]).unwrap_err();
+        }
+    }
 
     fn get_pseudo_exec_file_path() -> String {
         format!(

@@ -10,8 +10,10 @@ and this project adheres to
 
 ### Added
 
-- Explicit x86_64 KVM NUMA configuration with CPU affinity, memory binding
-  and ACPI SRAT/SLIT. See [NUMA configuration](docs/numa.md).
+- Explicit x86_64 KVM NUMA configuration with vCPU affinity, memory binding,
+  ACPI SRAT/SLIT and caller-configured PCI roots, bridges, bus numbers and
+  endpoint addresses. PCI root `_PXM` uses the supplied guest NUMA domain.
+  See [NUMA and PCI topology](docs/pci-numa.md).
 
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),

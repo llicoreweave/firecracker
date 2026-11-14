@@ -1,7 +1,7 @@
 // Copyright 2025 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -14,9 +14,9 @@ use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
 use crate::devices::pci::root_port::{PciRootPortRestoreError, PciRootPortState};
-use crate::devices::vfio::VfioContext;
-use crate::devices::vfio::VfioError;
+use crate::devices::pci::static_topology::StaticTopology;
 use crate::devices::vfio::pci::{BarRequirement, BarSlot, BarWindow, VfioPciDevice, VfioPciError};
+use crate::devices::vfio::{VfioContext, VfioError};
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonConstructorArgs;
 use crate::devices::virtio::block::device::Block;
@@ -69,10 +69,17 @@ pub struct PciDevices {
     pub vfio_devices: HashMap<String, Arc<Mutex<VfioPciDevice>>>,
     /// The IOMMU context shared by the VFIO devices, if any is attached.
     pub vfio_context: Option<VfioContext>,
+    pub(crate) topology: Option<StaticTopology>,
+    topology_paths: BTreeMap<String, Vec<u8>>,
+    topology_order: Vec<Vec<u8>>,
+    numa: Option<crate::numa::NumaConfig>,
+    topology_ranges: Vec<(Vec<u8>, u64, u64, bool)>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum PciManagerError {
+    /// Invalid experimental static PCI topology: {0}
+    Topology(String),
     /// Resource allocation error: {0}
     ResourceAllocation(#[from] vm_allocator::Error),
     /// Device {0} sets dmb_size_mib, which this transport does not support
@@ -118,6 +125,11 @@ impl PciDevices {
             virtio_devices: HashMap::new(),
             vfio_devices: HashMap::new(),
             vfio_context: None,
+            topology: None,
+            topology_paths: BTreeMap::new(),
+            topology_order: Vec::new(),
+            numa: vm.common.numa.clone(),
+            topology_ranges: Vec::new(),
         })
     }
 
@@ -228,6 +240,11 @@ impl PciDevices {
 
     /// Attach the configured number of PCIe root ports.
     pub(crate) fn attach_root_ports(&mut self, vm: &Arc<KvmVm>) -> Result<(), PciManagerError> {
+        // Static buses and bridges have already been materialized from the supplied graph.
+        // The segment's hotplug path interprets secondary buses as reserved root ports.
+        if self.topology.is_some() {
+            return Ok(());
+        }
         self.pci_segment.attach_root_ports(vm)
     }
 
@@ -238,6 +255,33 @@ impl PciDevices {
     ) -> Result<(), acpi_tables::aml::AmlError> {
         use acpi_tables::Aml;
 
+        if let Some(plan) = &self.topology {
+            let segment = self.pci_segment();
+            for root in &plan.config.roots {
+                let windows = |prefetch| {
+                    pci_root_windows(
+                        plan,
+                        &self.topology_ranges,
+                        root.bus,
+                        prefetch,
+                        if prefetch {
+                            (segment.start_of_mem64_area, segment.end_of_mem64_area)
+                        } else {
+                            (segment.start_of_mem32_area, segment.end_of_mem32_area)
+                        },
+                    )
+                };
+                PciSegment::append_configured_root(
+                    dsdt_data,
+                    segment.mmio_config_address,
+                    root,
+                    &windows(false),
+                    &windows(true),
+                    &segment.pci_irq_slots,
+                )?;
+            }
+            return Ok(());
+        }
         self.pci_segment().append_aml_bytes(dsdt_data)
     }
 
@@ -340,6 +384,9 @@ impl PciDevices {
         configs: &[(String, &Path)],
     ) -> Result<(), PciManagerError> {
         if configs.is_empty() {
+            if let Some(plan) = &self.topology {
+                plan.install(&self.pci_segment.pci_buses, &[])?;
+            }
             return Ok(());
         }
         // Only one attach is supported: all the devices must share a single IOMMU context.
@@ -358,6 +405,46 @@ impl PciDevices {
         Ok(())
     }
 
+    /// Validate the requested tree before any host VFIO devices are opened.
+    pub fn configure_static_topology(
+        &mut self,
+        topology: &crate::vmm_config::pci_topology::PciTopologyConfig,
+        configs: &[crate::vmm_config::vfio::VfioDeviceConfig],
+    ) -> Result<(), PciManagerError> {
+        if !self.pci_segment.root_ports.is_empty() {
+            return Err(PciManagerError::Topology(
+                "static PCI topology cannot use hotplug ports".into(),
+            ));
+        }
+        let plan = StaticTopology::new(
+            topology,
+            configs,
+            self.numa.as_ref().map_or(0, |n| n.nodes.len()),
+        )
+        .map_err(PciManagerError::Topology)?;
+        for address in topology
+            .bridges
+            .iter()
+            .map(|b| b.pci_address)
+            .chain(configs.iter().filter_map(|c| c.pci_address))
+        {
+            if self
+                .pci_segment
+                .pci_buses
+                .get(address.bus)
+                .is_some_and(|bus| bus.lock().unwrap().get_device(address.device).is_some())
+            {
+                return Err(PciManagerError::Topology(
+                    "configured PCI address is already occupied".into(),
+                ));
+            }
+        }
+        self.topology_paths = plan.paths.clone();
+        self.topology_order = configs.iter().map(|c| plan.paths[&c.id].clone()).collect();
+        self.topology = Some(plan);
+        Ok(())
+    }
+
     /// Add passthrough devices to the PCI bus, each built by its constructor at the SBDF it is
     /// given, then place and map the BARs of all of them.
     fn add_vfio_devices<F>(
@@ -368,27 +455,31 @@ impl PciDevices {
     where
         F: FnOnce(PciSBDF) -> Result<VfioPciDevice, VfioPciError>,
     {
+        let plan = self.topology.as_ref().ok_or_else(|| {
+            PciManagerError::Topology("VFIO requires explicit pci-topology".into())
+        })?;
         let mut devices = Vec::new();
         let mut intx_gsis = IntxGsis::default();
-        for constructor in constructors {
-            // The bus does not reserve the device ID it hands out: each device is added to the
-            // bus before the next ID is taken.
-            let sbdf = self.pci_segment.next_device_sbdf()?;
+        for (index, constructor) in constructors.into_iter().enumerate() {
+            // Constructors follow the caller's configuration order.
+            let path = self
+                .topology_order
+                .get(index)
+                .ok_or_else(|| PciManagerError::Topology("missing endpoint address".into()))?;
+            let sbdf = plan.address(path);
             let mut device = constructor(sbdf)?;
             debug!("Allocating SBDF: {sbdf:?} for VFIO device {}", device.id());
-            if device.supports_intx() {
+            if device.supports_intx() && plan.config.bridges.is_empty() {
+                if sbdf.bus() != 0 {
+                    return Err(PciManagerError::Topology(
+                        "INTx requires root bus zero".into(),
+                    ));
+                }
                 let gsi = intx_gsis.next(&mut vm.resource_allocator())?;
                 debug!("vfio: routing INTx of {} to GSI {gsi}", device.id());
                 device.route_intx(gsi)?;
             }
             let device = Arc::new(Mutex::new(device));
-            self.pci_segment
-                .pci_buses
-                .get(0)
-                .unwrap()
-                .lock()
-                .expect("Poisoned lock")
-                .add_device(sbdf.device(), device.clone())?;
             devices.push(device);
         }
 
@@ -403,13 +494,52 @@ impl PciDevices {
                     .map(move |requirement| (device, requirement))
             })
             .collect();
-        let placements = place_vfio_bars(&mut vm.resource_allocator(), requirements)?;
+        let placements = if plan.config.roots.len() > 1 || !plan.config.bridges.is_empty() {
+            place_grouped_vfio_bars(
+                &mut vm.resource_allocator(),
+                requirements,
+                &self.topology_order,
+                self.topology.as_ref(),
+            )?
+        } else {
+            place_vfio_bars(&mut vm.resource_allocator(), requirements)?
+        };
+        let mut topology_ranges = Vec::new();
         for (device, slot, guest_addr) in placements {
+            if self.topology.is_some() {
+                let locked = devices[device].lock().unwrap();
+                let requirement = locked
+                    .bar_requirements()
+                    .into_iter()
+                    .find(|r| r.slot == slot)
+                    .unwrap();
+                topology_ranges.push((
+                    self.topology_paths[locked.id()].clone(),
+                    guest_addr,
+                    requirement.size,
+                    requirement.window == BarWindow::Mmio64,
+                ));
+            }
             devices[device]
                 .lock()
                 .expect("Poisoned lock")
                 .place_bar(slot, guest_addr);
         }
+
+        if let Some(plan) = &self.topology {
+            plan.install(&self.pci_segment.pci_buses, &topology_ranges)?;
+            for device in &devices {
+                let bdf = device.lock().unwrap().sbdf();
+                self.pci_segment
+                    .pci_buses
+                    .get(bdf.bus())
+                    .ok_or_else(|| PciBusError::InvalidBusNumber(bdf.bus()))?
+                    .lock()
+                    .unwrap()
+                    .add_device(bdf.device(), device.clone())?;
+            }
+        }
+        self.topology_ranges = topology_ranges;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -438,6 +568,11 @@ impl PciDevices {
         }
 
         Ok(())
+    }
+
+    /// Whether the cold-boot graph has state that is absent from snapshots.
+    pub fn has_configured_topology(&self) -> bool {
+        self.topology.is_some()
     }
 
     /// Whether any VFIO passthrough device is currently attached.
@@ -576,6 +711,522 @@ impl IntxGsis {
 /// BARs are naturally aligned powers of two. Placing them largest first, each at the highest
 /// suitable address of its window, packs them without fragmentation below the top of the window,
 /// away from the virtio-pci BARs which are allocated from the bottom.
+#[cfg(test)]
+fn place_static_vfio_bars(
+    allocator: &mut ResourceAllocator,
+    requirements: Vec<(usize, BarRequirement)>,
+    roots: &[u8],
+) -> Result<Vec<(usize, BarSlot, u64)>, vm_allocator::Error> {
+    let paths: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, root)| vec![*root, u8::try_from(i).unwrap()])
+        .collect();
+    place_grouped_vfio_bars(allocator, requirements, &paths, None)
+}
+
+struct SubtreeBars {
+    size: u64,
+    alignment: u64,
+    entries: Vec<(usize, BarSlot, u64)>,
+}
+
+fn align_bar(value: u64, alignment: u64) -> Result<u64, vm_allocator::Error> {
+    value
+        .checked_add(alignment - 1)
+        .map(|v| v & !(alignment - 1))
+        .ok_or(vm_allocator::Error::ResourceNotAvailable)
+}
+
+/// Plan bottom-up so sibling bridges never decode each other's BARs, including
+/// the mandatory 1-MiB bridge window granularity. Only assigned endpoints enter
+/// this tree; physical bridges and unassigned host functions are never opened.
+fn subtree_bars(
+    requirements: &[(usize, BarRequirement)],
+    paths: &[Vec<u8>],
+    depth: usize,
+) -> Result<SubtreeBars, vm_allocator::Error> {
+    let mut result = SubtreeBars {
+        size: 0,
+        alignment: 1 << 20,
+        entries: Vec::new(),
+    };
+    if paths[requirements[0].0].len() == depth {
+        let mut bars = requirements.to_vec();
+        bars.sort_by_key(|(_, b)| std::cmp::Reverse(b.size));
+        for (device, bar) in bars {
+            result.alignment = result.alignment.max(bar.size);
+            result.size = align_bar(result.size, bar.size)?;
+            result.entries.push((device, bar.slot, result.size));
+            result.size = result
+                .size
+                .checked_add(bar.size)
+                .ok_or(vm_allocator::Error::ResourceNotAvailable)?;
+        }
+    } else {
+        let mut children = BTreeMap::<u8, Vec<(usize, BarRequirement)>>::new();
+        for &(device, bar) in requirements {
+            children
+                .entry(paths[device][depth])
+                .or_default()
+                .push((device, bar));
+        }
+        let mut layouts = children
+            .values()
+            .map(|bars| subtree_bars(bars, paths, depth + 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        layouts.sort_by_key(|child| std::cmp::Reverse((child.alignment, child.size)));
+        for child in layouts {
+            result.alignment = result.alignment.max(child.alignment);
+            let base = align_bar(result.size, child.alignment)?;
+            result.size = base
+                .checked_add(child.size)
+                .ok_or(vm_allocator::Error::ResourceNotAvailable)?;
+            result.entries.extend(
+                child
+                    .entries
+                    .into_iter()
+                    .map(|(dev, slot, offset)| (dev, slot, base + offset)),
+            );
+        }
+    }
+    result.size = align_bar(result.size, 1 << 20)?;
+    Ok(result)
+}
+
+/// Reserve consecutive windows by configured root bus, even when root slots are
+/// interleaved. Exact placement prevents filling a previous root's gaps.
+fn place_grouped_vfio_bars(
+    allocator: &mut ResourceAllocator,
+    requirements: Vec<(usize, BarRequirement)>,
+    paths: &[Vec<u8>],
+    plan: Option<&StaticTopology>,
+) -> Result<Vec<(usize, BarSlot, u64)>, vm_allocator::Error> {
+    let mut groups = BTreeMap::<(u8, u8), Vec<(usize, BarRequirement)>>::new();
+    for (device, bar) in requirements {
+        let (bus, root) = if plan.is_some() {
+            (paths[device][0], paths[device][1])
+        } else {
+            (0, paths[device][0])
+        };
+        groups.entry((bus, root)).or_default().push((device, bar));
+    }
+    let mut next = [None, None];
+    let mut placed = Vec::new();
+    for bars in groups.values() {
+        for (index, kind) in [BarWindow::Mmio32, BarWindow::Mmio64]
+            .into_iter()
+            .enumerate()
+        {
+            let bars: Vec<_> = bars
+                .iter()
+                .filter(|(_, b)| b.window == kind)
+                .copied()
+                .collect();
+            if bars.is_empty() {
+                continue;
+            }
+            let layout = subtree_bars(&bars, paths, if plan.is_some() { 2 } else { 1 })?;
+            let parent = match kind {
+                BarWindow::Mmio32 => &mut allocator.mmio32_memory,
+                BarWindow::Mmio64 => &mut allocator.mmio64_memory,
+            };
+            let policy = match next[index] {
+                Some(cursor) => {
+                    vm_allocator::AllocPolicy::ExactMatch(align_bar(cursor, layout.alignment)?)
+                }
+                None => vm_allocator::AllocPolicy::FirstMatch,
+            };
+            let range = parent.allocate(layout.size, layout.alignment, policy)?;
+            next[index] = range.end().checked_add(1);
+            placed.extend(
+                layout
+                    .entries
+                    .into_iter()
+                    .map(|(dev, slot, offset)| (dev, slot, range.start() + offset)),
+            );
+        }
+    }
+    Ok(placed)
+}
+
+/// ACPI root windows are disjoint and cover each bridge's 1-MiB decoding
+/// granularity. Root zero owns the remaining aperture, including virtio BARs.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn pci_root_windows(
+    plan: &StaticTopology,
+    ranges: &[(Vec<u8>, u64, u64, bool)],
+    root_bus: u8,
+    prefetch: bool,
+    aperture: (u64, u64),
+) -> Vec<(u64, u64)> {
+    let span = |root_bus: u8| {
+        let selected: Vec<_> = ranges
+            .iter()
+            .filter(|(path, _, _, pref)| *pref == prefetch && path[0] == root_bus)
+            .collect();
+        Some((
+            selected.iter().map(|r| r.1).min()? & !((1 << 20) - 1),
+            selected.iter().map(|r| r.1 + r.2 - 1).max()? | ((1 << 20) - 1),
+        ))
+    };
+    if root_bus != 0 {
+        return span(root_bus).into_iter().collect();
+    }
+    let mut holes: Vec<_> = plan
+        .config
+        .roots
+        .iter()
+        .filter(|r| r.bus != 0)
+        .filter_map(|r| span(r.bus))
+        .collect();
+    holes.sort_unstable();
+    let mut result = Vec::new();
+    let (mut next, end) = aperture;
+    for (low, high) in holes {
+        if next < low {
+            result.push((next, low - 1));
+        }
+        next = high + 1;
+    }
+    if next <= end {
+        result.push((next, end));
+    }
+    result
+}
+
+#[cfg(test)]
+mod static_placement_tests {
+    use super::*;
+
+    #[test]
+    fn static_placement_nested_siblings_and_interleaved_numa_roots() {
+        use crate::vmm_config::pci_topology::*;
+        let paths = vec![
+            vec![0, 1, 0, 1, 0],
+            vec![20, 2, 0],
+            vec![10, 3, 0],
+            vec![0, 1, 0, 2, 0],
+            vec![0, 1, 0, 1, 1],
+        ];
+        let config = PciTopologyConfig {
+            roots: vec![
+                PciRootConfig {
+                    bus: 0,
+                    last_bus: 9,
+                    numa_node: Some(2),
+                },
+                PciRootConfig {
+                    bus: 20,
+                    last_bus: 29,
+                    numa_node: Some(0),
+                },
+                PciRootConfig {
+                    bus: 10,
+                    last_bus: 19,
+                    numa_node: Some(0),
+                },
+            ],
+            bridges: vec![
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 0,
+                        device: 1,
+                        function: 0,
+                    },
+                    secondary_bus: 1,
+                    subordinate_bus: 4,
+                    kind: PciBridgeKind::RootPort,
+                },
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 1,
+                        device: 0,
+                        function: 0,
+                    },
+                    secondary_bus: 2,
+                    subordinate_bus: 4,
+                    kind: PciBridgeKind::UpstreamPort,
+                },
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 2,
+                        device: 1,
+                        function: 0,
+                    },
+                    secondary_bus: 3,
+                    subordinate_bus: 3,
+                    kind: PciBridgeKind::DownstreamPort,
+                },
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 2,
+                        device: 2,
+                        function: 0,
+                    },
+                    secondary_bus: 4,
+                    subordinate_bus: 4,
+                    kind: PciBridgeKind::DownstreamPort,
+                },
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 20,
+                        device: 2,
+                        function: 0,
+                    },
+                    secondary_bus: 21,
+                    subordinate_bus: 21,
+                    kind: PciBridgeKind::RootPort,
+                },
+                PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 10,
+                        device: 3,
+                        function: 0,
+                    },
+                    secondary_bus: 11,
+                    subordinate_bus: 11,
+                    kind: PciBridgeKind::RootPort,
+                },
+            ],
+        };
+        let plan = StaticTopology::new(&config, &[], 3).unwrap();
+        let requirements: Vec<_> = (0..paths.len())
+            .map(|device| {
+                (
+                    device,
+                    BarRequirement {
+                        slot: BarSlot::Bar(0),
+                        size: 4096,
+                        window: BarWindow::Mmio64,
+                    },
+                )
+            })
+            .collect();
+        let mut allocator = ResourceAllocator::new();
+        let placed =
+            place_grouped_vfio_bars(&mut allocator, requirements, &paths, Some(&plan)).unwrap();
+        let address = |dev| placed.iter().find(|(d, _, _)| *d == dev).unwrap().2;
+        // The neighboring downstream bridge must not decode either endpoint
+        // on the first bridge's bus, even with interleaved configuration order.
+        assert!(
+            address(3) < address(0).min(address(4))
+                || address(3) >= address(0).max(address(4)) + (1 << 20)
+        );
+        let ranges: Vec<_> = placed
+            .iter()
+            .map(|(dev, _, base)| (paths[*dev].clone(), *base, 4096, true))
+            .collect();
+        let windows: Vec<_> = [0, 10, 20]
+            .into_iter()
+            .map(|domain| {
+                pci_root_windows(
+                    &plan,
+                    &ranges,
+                    domain,
+                    true,
+                    (
+                        allocator.mmio64_memory.base(),
+                        allocator.mmio64_memory.end(),
+                    ),
+                )
+            })
+            .collect();
+        for first in 0..3 {
+            for second in first + 1..3 {
+                for &(a, b) in &windows[first] {
+                    for &(c, d) in &windows[second] {
+                        assert!(b < c || d < a);
+                    }
+                }
+            }
+        }
+        assert!(address(2) < address(1)); // Configured root bus order, independent of NUMA affinity.
+    }
+
+    #[test]
+    fn static_placement_flat_multiple_roots_have_disjoint_bar_windows() {
+        use crate::vmm_config::pci_topology::*;
+        let config = PciTopologyConfig {
+            roots: [0, 20, 40]
+                .map(|bus| PciRootConfig {
+                    bus,
+                    last_bus: bus,
+                    numa_node: None,
+                })
+                .to_vec(),
+            bridges: vec![],
+        };
+        let plan = StaticTopology::new(&config, &[], 0).unwrap();
+        let paths = vec![vec![0, 1], vec![20, 1], vec![40, 1]];
+        let requirements: Vec<_> = [
+            (0, 16 << 20),
+            (0, 1 << 20),
+            (1, 8 << 20),
+            (1, 4 << 20),
+            (2, 2 << 20),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (device, size))| {
+            (
+                device,
+                BarRequirement {
+                    slot: BarSlot::Bar(u8::try_from(i).unwrap()),
+                    size,
+                    window: BarWindow::Mmio64,
+                },
+            )
+        })
+        .collect();
+        let mut allocator = ResourceAllocator::new();
+        let placed =
+            place_grouped_vfio_bars(&mut allocator, requirements.clone(), &paths, Some(&plan))
+                .unwrap();
+        let ranges: Vec<_> = placed
+            .iter()
+            .map(|(dev, slot, base)| {
+                (
+                    paths[*dev].clone(),
+                    *base,
+                    requirements
+                        .iter()
+                        .find(|(d, b)| d == dev && b.slot == *slot)
+                        .unwrap()
+                        .1
+                        .size,
+                    true,
+                )
+            })
+            .collect();
+        let windows: Vec<_> = [0, 20, 40]
+            .map(|bus| {
+                pci_root_windows(
+                    &plan,
+                    &ranges,
+                    bus,
+                    true,
+                    (
+                        allocator.mmio64_memory.base(),
+                        allocator.mmio64_memory.end(),
+                    ),
+                )
+            })
+            .to_vec();
+        for (path, base, size, _) in &ranges {
+            let domain = match path[0] {
+                0 => 0,
+                20 => 1,
+                _ => 2,
+            };
+            assert!(
+                windows[domain]
+                    .iter()
+                    .any(|(low, high)| low <= base && base + size - 1 <= *high)
+            );
+        }
+        for first in 0..3 {
+            for second in first + 1..3 {
+                for &(a, b) in &windows[first] {
+                    for &(c, d) in &windows[second] {
+                        assert!(b < c || d < a);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn static_placement_reports_exhausted_aperture() {
+        let mut allocator = ResourceAllocator::new();
+        allocator.mmio64_memory = vm_allocator::AddressAllocator::new(1 << 40, 1 << 20).unwrap();
+        place_static_vfio_bars(
+            &mut allocator,
+            vec![(
+                0,
+                BarRequirement {
+                    slot: BarSlot::Bar(0),
+                    size: 2 << 20,
+                    window: BarWindow::Mmio64,
+                },
+            )],
+            &[1],
+        )
+        .unwrap_err();
+    }
+    #[test]
+    fn static_placement_full_fabric_sibling_windows_do_not_overlap() {
+        let mut allocator = ResourceAllocator::new();
+        allocator
+            .mmio32_memory
+            .allocate(13 * 4096, 4096, vm_allocator::AllocPolicy::FirstMatch)
+            .unwrap();
+        let mut requirements = Vec::new();
+        let mut roots = Vec::new();
+        for root in [13, 14, 15, 16, 18, 19, 20, 21] {
+            let gpu = roots.len();
+            roots.push(root);
+            for (index, size) in [(0, 16 << 20), (2, 128 << 30), (4, 32 << 20)] {
+                requirements.push((
+                    gpu,
+                    BarRequirement {
+                        slot: BarSlot::Bar(index),
+                        size,
+                        window: BarWindow::Mmio64,
+                    },
+                ));
+            }
+            let nic = roots.len();
+            roots.push(root);
+            requirements.push((
+                nic,
+                BarRequirement {
+                    slot: BarSlot::Bar(0),
+                    size: 32 << 20,
+                    window: BarWindow::Mmio64,
+                },
+            ));
+        }
+        for _ in 0..4 {
+            let switch = roots.len();
+            roots.push(17);
+            requirements.push((
+                switch,
+                BarRequirement {
+                    slot: BarSlot::Bar(0),
+                    size: 32 << 20,
+                    window: BarWindow::Mmio32,
+                },
+            ));
+        }
+        let placed = place_static_vfio_bars(&mut allocator, requirements.clone(), &roots).unwrap();
+        assert_eq!(placed.len(), 36);
+        for gpu in (0..16).step_by(2) {
+            let span = |device| {
+                let bars: Vec<_> = placed.iter().filter(|(d, _, _)| *d == device).collect();
+                let begin = bars.iter().map(|(_, _, base)| *base).min().unwrap();
+                let end = bars
+                    .iter()
+                    .map(|(_, slot, base)| {
+                        base + requirements
+                            .iter()
+                            .find(|(d, r)| *d == device && r.slot == *slot)
+                            .unwrap()
+                            .1
+                            .size
+                            - 1
+                    })
+                    .max()
+                    .unwrap();
+                (begin, end)
+            };
+            let (gpu_start, gpu_end) = span(gpu);
+            let (nic_start, nic_end) = span(gpu + 1);
+            assert!(gpu_end < nic_start || nic_end < gpu_start);
+        }
+    }
+}
+
 fn place_vfio_bars(
     allocator: &mut ResourceAllocator,
     mut requirements: Vec<(usize, BarRequirement)>,
@@ -980,9 +1631,9 @@ impl<'a> Persist<'a> for PciDevices {
             )?
         }
 
-        // After PCI devices are restored, we must set up the GSI routes (one KVM_SET_GSI_ROUTING call for all vectors),
-        // and enable all unmasked vectors (one kvm_irqfd call per vector).
-        // Ordering: routing must be set before IRQFDs to avoid kernel panics on
+        // After PCI devices are restored, we must set up the GSI routes (one KVM_SET_GSI_ROUTING
+        // call for all vectors), and enable all unmasked vectors (one kvm_irqfd call per
+        // vector). Ordering: routing must be set before IRQFDs to avoid kernel panics on
         // older AMD/SVM hosts (see kernel commit a80ced6ea514).
         if !pci_devices.virtio_devices.is_empty() || !pci_state.root_ports.is_empty() {
             constructor_args
@@ -1025,6 +1676,52 @@ mod tests {
     use crate::vmm_config::pmem::PmemConfig;
     use crate::vmm_config::vsock::VsockDeviceConfig;
     use crate::vstate::resources::ResourceAllocator;
+
+    #[test]
+    fn test_static_pci_graph_does_not_add_hotplug_ports() {
+        use crate::vmm_config::pci_topology::{
+            PciAddress, PciBridgeConfig, PciBridgeKind, PciRootConfig, PciTopologyConfig,
+        };
+
+        let mut vmm = default_vmm_with_pci();
+        let vm = vmm.vm.as_kvm().unwrap().clone();
+        let pci = device_manager::tests::pci_devices_mut(&mut vmm.device_manager);
+        let topology = PciTopologyConfig {
+            roots: vec![
+                PciRootConfig {
+                    bus: 0,
+                    last_bus: 2,
+                    numa_node: None,
+                },
+                PciRootConfig {
+                    bus: 25,
+                    last_bus: 25,
+                    numa_node: None,
+                },
+            ],
+            bridges: vec![PciBridgeConfig {
+                pci_address: PciAddress {
+                    bus: 0,
+                    device: 13,
+                    function: 0,
+                },
+                secondary_bus: 2,
+                subordinate_bus: 2,
+                kind: PciBridgeKind::RootPort,
+            }],
+        };
+        pci.configure_static_topology(&topology, &[]).unwrap();
+        pci.attach_vfio_devices(&vm, &[]).unwrap();
+        pci.attach_root_ports(&vm).unwrap();
+
+        assert!(pci.pci_segment.root_ports.is_empty());
+        assert_eq!(pci.pci_segment.next_device_sbdf().unwrap().device(), 1);
+        let root = pci.pci_segment.pci_buses.root_bus().lock().unwrap();
+        let mut bridge = root.get_device(13).unwrap().lock().unwrap();
+        assert_eq!(bridge.read_config_register(6), 0x0002_0200);
+        assert!(pci.pci_segment.pci_buses.get(25).is_some());
+        assert!(pci.pci_segment.pci_buses.get(1).is_none());
+    }
 
     #[test]
     fn test_device_manager_persistence() {
@@ -1501,9 +2198,33 @@ mod tests {
         let mut pci_devices = PciDevices::new(&vm, 0).unwrap();
         let first = pci_devices.pci_segment.next_device_sbdf().unwrap().device();
 
-        // The bus does not reserve the device IDs it hands out, yet every device gets a slot of
-        // its own, as all the functions of an IOMMU group attached to one microVM need.
+        // Explicit flat addresses preserve INTA routing and resource allocation.
         let ids = ["gpu0", "audio0"];
+        use crate::vmm_config::pci_topology::*;
+        let topology = PciTopologyConfig {
+            roots: vec![PciRootConfig {
+                bus: 0,
+                last_bus: 0,
+                numa_node: None,
+            }],
+            bridges: vec![],
+        };
+        let configs: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| crate::vmm_config::vfio::VfioDeviceConfig {
+                id: id.to_string(),
+                path: "/host/device".into(),
+                pci_address: Some(PciAddress {
+                    bus: 0,
+                    device: first + u8::try_from(i).unwrap(),
+                    function: 0,
+                }),
+            })
+            .collect();
+        pci_devices
+            .configure_static_topology(&topology, &configs)
+            .unwrap();
         pci_devices
             .add_vfio_devices(
                 &vm,

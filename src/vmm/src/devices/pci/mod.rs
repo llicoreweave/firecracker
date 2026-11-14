@@ -3,5 +3,6 @@
 
 pub mod pci_segment;
 pub mod root_port;
+pub mod static_topology;
 
 pub use pci_segment::*;

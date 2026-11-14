@@ -12,7 +12,6 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::utils::Version;
 use serde::{Deserialize, Serialize};
 use userfaultfd::{FeatureFlags, Uffd, UffdBuilder};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -25,19 +24,18 @@ use crate::cpu_config::templates::StaticCpuTemplate;
 use crate::cpu_config::x86_64::cpuid::CpuidTrait;
 #[cfg(target_arch = "x86_64")]
 use crate::cpu_config::x86_64::cpuid::common::get_vendor_id_from_host;
-use crate::device_manager::persist::{DeviceStates, VirtioDeviceState};
-
-use crate::device_manager::pci_mngr::PciDevices;
-use crate::device_manager::{DevicePersistError, DevicesState};
 // Re-exported so external crates inspecting a `MicrovmState` snapshot can match on the
 // serialised virtio transport variant.
 pub use crate::device_manager::VirtioDevicesState;
+use crate::device_manager::pci_mngr::PciDevices;
+use crate::device_manager::persist::{DeviceStates, VirtioDeviceState};
+use crate::device_manager::{DevicePersistError, DevicesState};
 use crate::devices::virtio::block::persist::BlockState;
 use crate::logger::{info, warn};
 use crate::resources::VmResources;
 use crate::seccomp::BpfThreadMap;
 use crate::snapshot::Snapshot;
-use crate::utils::u64_to_usize;
+use crate::utils::{Version, u64_to_usize};
 use crate::vmm_config::boot_source::BootSourceConfig;
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
@@ -173,6 +171,8 @@ pub enum CreateSnapshotError {
     VfioNotSupported,
     /// Snapshotting a NUMA microVM is not supported
     NumaNotSupported,
+    /// Snapshots do not preserve explicitly configured PCI graphs.
+    PciTopologyNotSupported,
 }
 
 /// Snapshot version
@@ -196,6 +196,14 @@ pub fn create_snapshot(
         .is_some_and(PciDevices::has_vfio_devices)
     {
         return Err(CreateSnapshotError::VfioNotSupported);
+    }
+
+    if vmm
+        .device_manager
+        .pci_devices()
+        .is_some_and(PciDevices::has_configured_topology)
+    {
+        return Err(CreateSnapshotError::PciTopologyNotSupported);
     }
 
     let microvm_state = vmm
@@ -468,8 +476,8 @@ pub fn restore_from_snapshot(
     );
     if pci_enabled != vm_resources.pci_enabled {
         warn!(
-            "The snapshot's PCI configuration does not match --enable-pci; \
-             following the snapshot configuration."
+            "The snapshot's PCI configuration does not match --enable-pci; following the snapshot \
+             configuration."
         );
     }
     vm_resources.pci_enabled = pci_enabled;

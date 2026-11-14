@@ -424,11 +424,25 @@ mod tests {
         resources.machine_config.vcpu_count = 64;
         resources.machine_config.mem_size_mib = 1048576;
         resources.numa = Some(config());
+        resources.pci_topology = Some(crate::vmm_config::pci_topology::PciTopologyConfig {
+            roots: vec![crate::vmm_config::pci_topology::PciRootConfig {
+                bus: 0,
+                last_bus: 0,
+                numa_node: Some(0),
+            }],
+            bridges: vec![],
+        });
         resources.validate_numa().unwrap();
         resources.machine_config.mem_size_mib += 2;
         resources.validate_numa().unwrap_err();
         resources.machine_config.mem_size_mib -= 2;
         resources.pci_enabled = false;
+        resources.validate_numa().unwrap_err();
+        resources.pci_enabled = true;
+        resources
+            .vfio
+            .configs
+            .push(crate::vmm_config::vfio::VfioDeviceConfig::default());
         resources.validate_numa().unwrap_err();
     }
 

@@ -1,0 +1,153 @@
+{
+  "pci-topology": {
+    "roots": [
+      {
+        "bus": 0,
+        "last_bus": 4,
+        "numa_node": 0
+      },
+      {
+        "bus": 5,
+        "last_bus": 8,
+        "numa_node": 1
+      }
+    ],
+    "bridges": [
+      {
+        "pci_address": {
+          "bus": 0,
+          "device": 13,
+          "function": 0
+        },
+        "secondary_bus": 1,
+        "subordinate_bus": 4,
+        "type": "root-port"
+      },
+      {
+        "pci_address": {
+          "bus": 1,
+          "device": 0,
+          "function": 0
+        },
+        "secondary_bus": 2,
+        "subordinate_bus": 4,
+        "type": "upstream-port"
+      },
+      {
+        "pci_address": {
+          "bus": 2,
+          "device": 1,
+          "function": 0
+        },
+        "secondary_bus": 3,
+        "subordinate_bus": 3,
+        "type": "downstream-port"
+      },
+      {
+        "pci_address": {
+          "bus": 2,
+          "device": 2,
+          "function": 0
+        },
+        "secondary_bus": 4,
+        "subordinate_bus": 4,
+        "type": "downstream-port"
+      },
+      {
+        "pci_address": {
+          "bus": 5,
+          "device": 14,
+          "function": 0
+        },
+        "secondary_bus": 6,
+        "subordinate_bus": 8,
+        "type": "root-port"
+      },
+      {
+        "pci_address": {
+          "bus": 6,
+          "device": 0,
+          "function": 0
+        },
+        "secondary_bus": 7,
+        "subordinate_bus": 8,
+        "type": "upstream-port"
+      },
+      {
+        "pci_address": {
+          "bus": 7,
+          "device": 1,
+          "function": 0
+        },
+        "secondary_bus": 8,
+        "subordinate_bus": 8,
+        "type": "downstream-port"
+      }
+    ]
+  },
+  "vfio": [
+    {
+      "id": "0000:a0:00.0",
+      "path": "/sys/bus/pci/devices/0000:a0:00.0",
+      "pci_address": {
+        "bus": 3,
+        "device": 0,
+        "function": 0
+      }
+    },
+    {
+      "id": "0000:a1:00.0",
+      "path": "/sys/bus/pci/devices/0000:a1:00.0",
+      "pci_address": {
+        "bus": 4,
+        "device": 0,
+        "function": 0
+      }
+    },
+    {
+      "id": "0000:b0:00.0",
+      "path": "/sys/bus/pci/devices/0000:b0:00.0",
+      "pci_address": {
+        "bus": 8,
+        "device": 0,
+        "function": 0
+      }
+    }
+  ],
+  "numa": {
+    "nodes": [
+      {
+        "host_node": 0,
+        "vcpus": [
+          0,
+          1
+        ],
+        "host_cpus": [
+          0,
+          2
+        ],
+        "memory_mib": 6
+      },
+      {
+        "host_node": 2,
+        "vcpus": [
+          2
+        ],
+        "host_cpus": [
+          1
+        ],
+        "memory_mib": 4
+      }
+    ],
+    "distances": [
+      [
+        10,
+        31
+      ],
+      [
+        31,
+        10
+      ]
+    ]
+  }
+}

@@ -10,6 +10,7 @@ path of a function bound to ``vfio-pci``, e.g.
 checks do not need any passthrough hardware and always run.
 """
 
+import json
 import os
 import platform
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from framework.artifacts import pin_pci
+from framework.kvm import default_boot_args
 
 VFIO_DEVICE = os.environ.get("FC_TEST_VFIO_DEVICE")
 # A PCI address that does not exist on any host (bus 0xff, device 0x1f,
@@ -67,11 +69,48 @@ def _assign(vm, devices=(VFIO_DEVICE,), mem_size_mib=256):
     # VFIO pins all guest memory, which the jailed process must be allowed to
     # lock.
     vm.jailer.resource_limits = [f"memlock={mem_size_mib << 20}"]
+    if platform.machine() != "x86_64":
+        pytest.skip("explicit PCI topology currently requires x86_64")
+    iface = vm.add_net_iface(api=False)
+    config = {
+        "boot-source": {
+            "kernel_image_path": vm.create_jailed_resource(vm.kernel_file),
+            "boot_args": default_boot_args(True),
+        },
+        "drives": [
+            {
+                "drive_id": "rootfs",
+                "is_root_device": True,
+                "is_read_only": True,
+                "path_on_host": vm.create_jailed_resource(vm.rootfs_file),
+            }
+        ],
+        "machine-config": {"vcpu_count": 2, "mem_size_mib": mem_size_mib},
+        "network-interfaces": [
+            {
+                "iface_id": iface.dev_name,
+                "host_dev_name": iface.tap_name,
+                "guest_mac": iface.guest_mac,
+            }
+        ],
+        "pci-topology": {
+            "roots": [{"bus": 0, "last_bus": 0}],
+            "bridges": [],
+        },
+        "vfio": [
+            {
+                "id": f"passthrough{index}",
+                "path": device,
+                "pci_address": {"bus": 0, "device": index + 16, "function": 0},
+            }
+            for index, device in enumerate(devices)
+        ],
+    }
+    config_file = Path(vm.chroot()) / "vfio-config.json"
+    config_file.write_text(json.dumps(config), encoding="utf-8")
+    vm.jailer.extra_args["config-file"] = config_file.name
     vm.spawn()
-    vm.basic_config(mem_size_mib=mem_size_mib)
-    vm.add_net_iface()
-    for index, device in enumerate(devices):
-        vm.api.vfio.put(id=f"passthrough{index}", path=device)
+    vm.wait_for_ssh_up()
 
 
 def _group_functions():
@@ -112,7 +151,11 @@ def test_vfio_requires_pci(uvm):
     vm = uvm
     vm.spawn()
     vm.basic_config()
-    vm.api.vfio.put(id="dev0", path=MISSING_DEVICE)
+    vm.api.vfio.put(
+        id="dev0",
+        path=MISSING_DEVICE,
+        pci_address={"bus": 0, "device": 16, "function": 0},
+    )
     with pytest.raises(RuntimeError, match="requires the PCIe transport"):
         vm.start()
 
@@ -124,7 +167,11 @@ def test_vfio_rejects_balloon(uvm):
     vm.spawn()
     vm.basic_config()
     vm.api.balloon.put(amount_mib=0, deflate_on_oom=False)
-    vm.api.vfio.put(id="dev0", path=MISSING_DEVICE)
+    vm.api.vfio.put(
+        id="dev0",
+        path=MISSING_DEVICE,
+        pci_address={"bus": 0, "device": 16, "function": 0},
+    )
     with pytest.raises(RuntimeError, match="cannot be combined with a balloon device"):
         vm.start()
 
@@ -136,19 +183,27 @@ def test_vfio_rejects_memory_hotplug(uvm):
     vm.spawn()
     vm.basic_config()
     vm.api.memory_hotplug.put(total_size_mib=1024)
-    vm.api.vfio.put(id="dev0", path=MISSING_DEVICE)
+    vm.api.vfio.put(
+        id="dev0",
+        path=MISSING_DEVICE,
+        pci_address={"bus": 0, "device": 16, "function": 0},
+    )
     with pytest.raises(RuntimeError, match="cannot be combined with memory hotplug"):
         vm.start()
 
 
 @pin_pci(True)
-def test_vfio_missing_device(uvm):
-    """Assigning a PCI function that does not exist fails at start."""
+def test_vfio_requires_explicit_topology(uvm):
+    """VFIO cannot start without a caller-supplied PCI topology."""
     vm = uvm
     vm.spawn()
     vm.basic_config()
-    vm.api.vfio.put(id="dev0", path=MISSING_DEVICE)
-    with pytest.raises(RuntimeError, match="Cannot determine the IOMMU group"):
+    vm.api.vfio.put(
+        id="dev0",
+        path=MISSING_DEVICE,
+        pci_address={"bus": 0, "device": 16, "function": 0},
+    )
+    with pytest.raises(RuntimeError, match="require explicit pci-topology"):
         vm.start()
 
 
@@ -164,7 +219,6 @@ def test_vfio_passthrough(uvm):
     host_bars = _memory_bar_sizes((host / "resource").read_text())
 
     _assign(vm)
-    vm.start()
 
     # The function shows up once on the guest PCI bus.
     guest_bdfs = vm.ssh.check_output(f"lspci -Dn -d {vendor}:{device}").stdout
@@ -250,7 +304,6 @@ def test_vfio_blocks_snapshot(uvm):
     """A microVM with a passthrough device cannot be snapshotted."""
     vm = uvm
     _assign(vm)
-    vm.start()
 
     vm.pause()
     with pytest.raises(RuntimeError, match="VFIO"):
@@ -277,7 +330,6 @@ def test_vfio_iommu_group(uvm):
 
     vm = uvm
     _assign(vm, functions)
-    vm.start()
 
     # Every function shows up on the guest PCI bus.
     for pci_id in ids:
@@ -349,7 +401,6 @@ def test_vfio_bar_relocation(uvm, devmem_bin):
     size = host_bars[index]
 
     _assign(vm)
-    vm.start()
     vm.ssh.scp_put(devmem_bin, DEVMEM_PATH)
     vm.ssh.check_output(f"chmod +x {DEVMEM_PATH}")
     bdf = vm.ssh.check_output(f"lspci -Dn -d {vendor}:{device}").stdout.split()[0]

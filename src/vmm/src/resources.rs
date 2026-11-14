@@ -91,6 +91,9 @@ pub enum CustomCpuTemplateOrPath {
 pub struct VmmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numa: Option<crate::numa::NumaConfig>,
+    /// Caller-specified PCI roots, bridges and bus numbers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_topology: Option<crate::vmm_config::pci_topology::PciTopologyConfig>,
     pub balloon: Option<BalloonDeviceConfig>,
     pub drives: Vec<BlockDeviceConfig>,
     pub boot_source: BootSourceConfig,
@@ -121,6 +124,8 @@ pub struct VmmConfig {
 pub struct VmResources {
     /// Explicit cold-boot NUMA configuration.
     pub numa: Option<crate::numa::NumaConfig>,
+    /// Caller-specified PCI roots, bridges and bus numbers.
+    pub pci_topology: Option<crate::vmm_config::pci_topology::PciTopologyConfig>,
     /// The vCpu and memory configuration for this microVM.
     pub machine_config: MachineConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
@@ -288,6 +293,7 @@ impl VmResources {
         }
 
         resources.numa = vmm_config.numa;
+        resources.pci_topology = vmm_config.pci_topology;
         resources.validate_numa().map_err(ResourcesError::Numa)?;
         Ok(resources)
     }
@@ -306,8 +312,25 @@ impl VmResources {
                 return Err("NUMA does not support memory hotplug or ballooning".into());
             }
         }
-        if self.enclave.is_some() && self.numa.is_some() {
-            return Err("NUMA requires KVM".into());
+        if self.enclave.is_some()
+            && (self.numa.is_some() || self.pci_topology.is_some() || !self.vfio.configs.is_empty())
+        {
+            return Err("NUMA, static PCI topology and VFIO require KVM".into());
+        }
+        if let Some(topology) = &self.pci_topology {
+            if self.machine_config.pcie_hotplug_ports != 0 {
+                return Err("static PCI topology cannot use hotplug ports".into());
+            }
+            if !cfg!(target_arch = "x86_64") || !self.pci_enabled {
+                return Err("explicit PCI topology requires x86_64 and --enable-pci".into());
+            }
+            crate::devices::pci::static_topology::StaticTopology::new(
+                topology,
+                &self.vfio.configs,
+                self.numa.as_ref().map_or(0, |n| n.nodes.len()),
+            )?;
+        } else if !self.vfio.configs.is_empty() {
+            return Err("VFIO devices require explicit pci-topology".into());
         }
         Ok(())
     }
@@ -702,6 +725,7 @@ impl From<&VmResources> for VmmConfig {
             memory_hotplug: resources.memory_hotplug.clone(),
             enclave: resources.enclave.clone(),
             numa: resources.numa.clone(),
+            pci_topology: resources.pci_topology.clone(),
         }
     }
 }
@@ -813,6 +837,7 @@ mod tests {
     fn default_vm_resources() -> VmResources {
         VmResources {
             numa: None,
+            pci_topology: None,
             machine_config: MachineConfig::default(),
             boot_source: default_boot_cfg(),
             block: default_blocks(),
@@ -1751,7 +1776,7 @@ mod tests {
             vm_resources.update_machine_config(&aux_vm_config),
             Err(MachineConfigError::InvalidVcpuCount)
         );
-        aux_vm_config.vcpu_count = Some(32);
+        aux_vm_config.vcpu_count = Some(crate::vstate::vm::MAX_SUPPORTED_KVM_VCPUS);
         #[cfg(target_arch = "x86_64")]
         vm_resources.update_machine_config(&aux_vm_config).unwrap();
         aux_vm_config.smt = Some(false);
@@ -2090,6 +2115,7 @@ mod tests {
         let cfg = VfioDeviceConfig {
             id: "gpu0".to_string(),
             path: "/sys/bus/pci/devices/0000:01:00.0".to_string(),
+            ..Default::default()
         };
         assert!(vm_resources.vfio.configs.is_empty());
         vm_resources.build_vfio_device(cfg.clone()).unwrap();
@@ -2099,6 +2125,7 @@ mod tests {
         let duplicate = VfioDeviceConfig {
             id: "gpu0".to_string(),
             path: "/sys/bus/pci/devices/0000:02:00.0".to_string(),
+            ..Default::default()
         };
         assert!(matches!(
             vm_resources.build_vfio_device(duplicate),
@@ -2107,6 +2134,7 @@ mod tests {
         assert_eq!(vm_resources.vfio.configs, vec![cfg]);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_vfio_config_json() {
         let kernel_file = TempFile::new().unwrap();
@@ -2116,7 +2144,8 @@ mod tests {
                 r#"{{
                     "boot-source": {{ "kernel_image_path": "{kernel_path}" }},
                     "drives": [],
-                    "vfio": {vfio}
+                    "vfio": {vfio},
+                    "pci-topology": {{"roots":[{{"bus":0,"last_bus":0}}],"bridges":[]}}
                 }}"#
             );
             VmResources::from_json(
@@ -2130,11 +2159,16 @@ mod tests {
 
         // The `vfio` array of the configuration file populates the VFIO builder.
         let resources =
-            from_json(r#"[{ "id": "gpu0", "path": "/sys/bus/pci/devices/0000:01:00.0" }]"#)
+            from_json(r#"[{ "id": "gpu0", "path": "/sys/bus/pci/devices/0000:01:00.0", "pci_address":{"bus":0,"device":1,"function":0} }]"#)
                 .unwrap();
         let expected = vec![VfioDeviceConfig {
             id: "gpu0".to_string(),
             path: "/sys/bus/pci/devices/0000:01:00.0".to_string(),
+            pci_address: Some(crate::vmm_config::pci_topology::PciAddress {
+                bus: 0,
+                device: 1,
+                function: 0,
+            }),
         }];
         assert_eq!(resources.vfio.configs, expected);
 
@@ -2144,7 +2178,7 @@ mod tests {
         let value = serde_json::to_value(&vmm_config).unwrap();
         assert_eq!(
             value["vfio"],
-            serde_json::json!([{ "id": "gpu0", "path": "/sys/bus/pci/devices/0000:01:00.0" }])
+            serde_json::json!([{ "id": "gpu0", "path": "/sys/bus/pci/devices/0000:01:00.0", "pci_address":{"bus":0,"device":1,"function":0} }])
         );
 
         // Without passthrough devices the key serializes as an empty list, placed between `pmem`

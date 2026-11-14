@@ -434,6 +434,11 @@ impl Vmm {
                 VfioDeviceConfig {
                     id: dev.id().to_string(),
                     path: dev.sysfs_path().to_string_lossy().into_owned(),
+                    pci_address: Some(crate::vmm_config::pci_topology::PciAddress {
+                        bus: dev.sbdf().bus(),
+                        device: dev.sbdf().device(),
+                        function: 0,
+                    }),
                 }
             })
             .collect();
@@ -444,6 +449,10 @@ impl Vmm {
         VmmConfig {
             balloon,
             numa: self.vm.as_kvm().and_then(|vm| vm.common.numa.clone()),
+            pci_topology: self
+                .device_manager
+                .pci_devices()
+                .and_then(|p| p.topology.as_ref().map(|t| t.config.clone())),
             drives: block,
             boot_source: self.boot_source_config.clone(),
             cpu_config: None,

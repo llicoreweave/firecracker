@@ -306,5 +306,6 @@ PL061 GPIO power button (exposed to the guest as `gpio-keys`); see
 ## VFIO passthrough
 
 `PUT /vfio/{id}` configures a passthrough PCI device before boot and requires
-`--enable-pci`. Its `id` and `path` fields identify the device. See
+`--enable-pci`. Its `id`, `path` and `pci_address` fields identify the device and guest address.
+Booting passthrough VMs requires `pci-topology` in a configuration file. See
 [PCI device passthrough](device-passthrough.md) for configuration and restrictions.

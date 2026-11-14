@@ -302,3 +302,9 @@ The `keyboard` requirement for `SendCtrlAltDel` applies to x86_64, which
 emulates an i8042 keyboard controller. On aarch64 the action instead drives a
 PL061 GPIO power button (exposed to the guest as `gpio-keys`); see
 [actions](api_requests/actions.md#sendctrlaltdel).
+
+## VFIO passthrough
+
+`PUT /vfio/{id}` configures a passthrough PCI device before boot and requires
+`--enable-pci`. Its `id` and `path` fields identify the device. See
+[PCI device passthrough](device-passthrough.md) for configuration and restrictions.

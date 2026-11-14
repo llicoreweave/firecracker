@@ -24,6 +24,7 @@ jailer --id <id> \
        [--chroot-base-dir <chroot_base>] \
        [--netns <netns>] \
        [--resource-limit <resource=value>] \
+       [--vfio-device <sysfs_path>] \
        [--daemonize] \
        [--new-pid-ns] \
        [--...extra arguments for Firecracker]
@@ -88,6 +89,10 @@ jailer --id <id> \
     as guest DRAM plus the hotpluggable memory region, if any.
   - `no-file`: Specifies a value one greater than the maximum file descriptor
     number that can be opened by this process.
+  - `memlock`: The maximum size in bytes of memory the process may lock. When
+    PCIe devices are assigned with VFIO, all guest memory is pinned for DMA and
+    counts against this limit, so it must be at least the guest memory size (see
+    [device passthrough](device-passthrough.md)).
 
 Here is an example on how to set multiple resource limits using this argument:
 
@@ -95,6 +100,10 @@ Here is an example on how to set multiple resource limits using this argument:
 --resource-limit fsize=250000000 --resource-limit no-file=1024
 ```
 
+- `--vfio-device` specifies the host sysfs path of a PCI function to assign to
+  the microVM with VFIO (e.g. `/sys/bus/pci/devices/0000:01:00.0`), exactly as
+  it is given in the Firecracker configuration. It can be used multiple times to
+  assign multiple functions. See [device passthrough](device-passthrough.md).
 - When present, `--daemonize` causes the jailer to call `setsid()` and redirect
   all three standard I/O file descriptors to `/dev/null`.
 - When present, `--new-pid-ns` causes the jailer to spawn the provided binary
@@ -145,6 +154,11 @@ After starting, the Jailer goes through the following operations:
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail. When
   `/dev/nitro_enclaves` is present on the host, create an equivalent for it too,
   so the jail can run [Nitro Sandboxes](nitro-sandboxes/README.md).
+- If `--vfio-device` is given, use `mknod` to create `/dev/vfio/vfio` and the
+  `/dev/vfio/<group>` node of the IOMMU group of each device inside the jail,
+  and recreate the `iommu_group` link of each device, at the same path and with
+  the same target as on the host. Firecracker uses that link to find the IOMMU
+  group of the device; no other part of the host sysfs is exposed.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
   by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`, and
   `/dev/nitro_enclaves` when present. The ownership is changed to the provided

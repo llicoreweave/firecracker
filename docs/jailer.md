@@ -25,6 +25,7 @@ jailer --id <id> \
        [--netns <netns>] \
        [--resource-limit <resource=value>] \
        [--vfio-device <sysfs_path>] \
+       [--numa-node <host_node>] \
        [--daemonize] \
        [--new-pid-ns] \
        [--...extra arguments for Firecracker]
@@ -104,6 +105,10 @@ Here is an example on how to set multiple resource limits using this argument:
   the microVM with VFIO (e.g. `/sys/bus/pci/devices/0000:01:00.0`), exactly as
   it is given in the Firecracker configuration. It can be used multiple times to
   assign multiple functions. See [device passthrough](device-passthrough.md).
+- `--numa-node` copies CPU-membership metadata for a selected host NUMA node
+  into the jail. Repeat it for every node used by the VM's explicit NUMA
+  configuration. It does not select devices or change PCI placement.
+
 - When present, `--daemonize` causes the jailer to call `setsid()` and redirect
   all three standard I/O file descriptors to `/dev/null`.
 - When present, `--new-pid-ns` causes the jailer to spawn the provided binary

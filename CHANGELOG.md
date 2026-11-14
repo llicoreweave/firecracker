@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Added
 
+- Explicit x86_64 KVM NUMA configuration with CPU affinity, memory binding
+  and ACPI SRAT/SLIT. See [NUMA configuration](docs/numa.md).
+
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),

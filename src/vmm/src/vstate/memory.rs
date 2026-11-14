@@ -38,7 +38,8 @@ use crate::{DirtyBitmap, align_down, align_up, warn_unrestricted};
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 
 /// The alignment used to allocate guest memory.
-/// Chosen to enable optimizations on host kernel, e.g. allow huge pages at the beginning of the memory space.
+/// Chosen to enable optimizations on host kernel, e.g. allow huge pages at the beginning of the
+/// memory space.
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);
 /// A mask to extract mmap's flags related to HUGETLB
 const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HUGE_SHIFT);
@@ -46,6 +47,8 @@ const HUGETLB_FLAG_MASK: libc::c_int = libc::MAP_HUGETLB | (0x3F << libc::MAP_HU
 /// Errors associated with dumping guest memory to file.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum MemoryError {
+    /// Failed to bind private NUMA RAM: {0}
+    Numa(io::Error),
     /// Cannot dump memory: {0}
     WriteMemory(GuestMemoryError),
     /// Cannot create mmap region: {0}
@@ -105,7 +108,8 @@ pub enum GuestRegionType {
 }
 
 /// A region of guest memory. Unmapped on drop.
-/// This struct doesn't provide any facility to access the memory or read its properties, see [GuestRegionMmap].
+/// This struct doesn't provide any facility to access the memory or read its properties, see
+/// [GuestRegionMmap].
 #[derive(Debug)]
 struct RawGuestRegionMmap {
     mmap_address: *mut u8,
@@ -148,12 +152,13 @@ impl RawGuestRegionMmap {
         //          (2 MiB-aligned)
         //
         //  1. Round requested_size up to page size -> `size_page_multiple`.
-        //  2. mmap(`size_page_multiple + GUEST_MEMORY_ALIGNMENT - page_size`) -> `ptr`.
-        //     `ptr` is page-aligned, so the worst-case distance to the next 2 MiB boundary
-        //     is `GUEST_MEMORY_ALIGNMENT - page_size` bytes. This guarantees the allocation
-        //     contains at least one 2 MiB-aligned region of `size_page_multiple` bytes.
+        //  2. mmap(`size_page_multiple + GUEST_MEMORY_ALIGNMENT - page_size`) -> `ptr`. `ptr` is
+        //     page-aligned, so the worst-case distance to the next 2 MiB boundary is
+        //     `GUEST_MEMORY_ALIGNMENT - page_size` bytes. This guarantees the allocation contains
+        //     at least one 2 MiB-aligned region of `size_page_multiple` bytes.
         //  3. Compute `aligned_ptr` = first 2 MiB boundary ≥ `ptr`.
-        //  4. munmap the head (`ptr..aligned_ptr`) and tail (`aligned_ptr + size_page_multiple..end`).
+        //  4. munmap the head (`ptr..aligned_ptr`) and tail (`aligned_ptr +
+        //     size_page_multiple..end`).
         //  5. Return the 2 MiB-aligned region of `size_page_multiple` bytes.
         //
         // Note: when `hugetlb_flags` is set, `page_size` equals `GUEST_MEMORY_ALIGNMENT` (2 MiB),
@@ -227,7 +232,8 @@ impl RawGuestRegionMmap {
         );
 
         // Unmap the head and tail to release them back to the kernel.
-        // Failures are non-critical (at worst we leak a `PROT_NONE` VMA slot), so we only print a warning.
+        // Failures are non-critical (at worst we leak a `PROT_NONE` VMA slot), so we only print a
+        // warning.
         if head_size > 0 {
             // SAFETY: `ptr` is page-aligned and `head_size` is a page multiple within our mapping.
             let ret = unsafe { libc::munmap(ptr, head_size) };
@@ -236,7 +242,8 @@ impl RawGuestRegionMmap {
             }
         }
         if tail_size > 0 {
-            // SAFETY: address is page-aligned and `tail_size` is a page multiple within our mapping.
+            // SAFETY: address is page-aligned and `tail_size` is a page multiple within our
+            // mapping.
             let ret = unsafe {
                 libc::munmap((aligned_ptr + size_page_multiple) as *mut c_void, tail_size)
             };
@@ -253,7 +260,8 @@ impl RawGuestRegionMmap {
 
     /// Allocates a region of memory of the given size, aligned with [GUEST_MEMORY_ALIGNMENT].
     ///
-    /// Note: the returned region of memory might be bigger than the requested size, as it is aligned to page-size.
+    /// Note: the returned region of memory might be bigger than the requested size, as it is
+    /// aligned to page-size.
     fn allocate(
         size: usize,
         prot: libc::c_int,
@@ -263,7 +271,8 @@ impl RawGuestRegionMmap {
     ) -> Result<Self, MemoryError> {
         let hugetlb_flags = Self::extract_huge_tlb_mmap_flags(flags);
 
-        // This function works by doing a mmap fixed over a GuestMmapRegion allocated with PROT_NONE.
+        // This function works by doing a mmap fixed over a GuestMmapRegion allocated with
+        // PROT_NONE.
         let ret = Self::allocate_protected(size, hugetlb_flags)?;
 
         // SAFETY: this mmap is performed over the same memory region we just allocated, so it's
@@ -308,9 +317,11 @@ impl RawGuestRegionMmap {
 
 impl Drop for RawGuestRegionMmap {
     fn drop(&mut self) {
-        // SAFETY: All memory access is done via GuestRegionMmap, and at this point there are no references to that.
+        // SAFETY: All memory access is done via GuestRegionMmap, and at this point there are no
+        // references to that.
         let ret = unsafe { libc::munmap(self.mmap_address.cast::<c_void>(), self.mmap_size) };
-        // Panicking if unmapping failed: otherwise the guest memory might still be accessible after drop!
+        // Panicking if unmapping failed: otherwise the guest memory might still be accessible after
+        // drop!
         assert_eq!(
             ret,
             0,
@@ -321,13 +332,15 @@ impl Drop for RawGuestRegionMmap {
 }
 
 /// SAFETY: Send and Sync aren't automatically inherited for the raw address pointer.
-/// RawGuestRegionMmap exclusively owns the memory region and doesn't expose the raw pointer for concurrent mutation.
+/// RawGuestRegionMmap exclusively owns the memory region and doesn't expose the raw pointer for
+/// concurrent mutation.
 unsafe impl Send for RawGuestRegionMmap {}
 /// SAFETY: See comment above.
 unsafe impl Sync for RawGuestRegionMmap {}
 
 /// A region of guest memory. Unmapped on drop.
-/// Note: this implements automatic defer for vm_memory::GuestRegionMmap, so it can be used in its place.
+/// Note: this implements automatic defer for vm_memory::GuestRegionMmap, so it can be used in its
+/// place.
 #[derive(Debug)]
 pub struct GuestRegionMmap {
     /// Held for its `Drop` impl which unmaps the guest memory region.
@@ -344,7 +357,8 @@ impl Deref for GuestRegionMmap {
 }
 
 impl GuestRegionMmap {
-    /// Creates a new [GuestRegionMmap], by actually allocating the guest memory with the given properties.
+    /// Creates a new [GuestRegionMmap], by actually allocating the guest memory with the given
+    /// properties.
     pub(crate) fn allocate(
         guest_base: GuestAddress,
         size: usize,
@@ -386,7 +400,8 @@ impl GuestRegionMmap {
         assert!(!mmap_region.owned());
         // `region` and `mapping` need to point to the same address.
         assert_eq!(region.mmap_address, mmap_region.as_ptr());
-        // Size might differ, as region.mmap_size is page-aligned. But it for sure cannot be smaller.
+        // Size might differ, as region.mmap_size is page-aligned. But it for sure cannot be
+        // smaller.
         assert!(region.mmap_size >= mmap_region.size());
 
         Ok(GuestRegionMmap {
@@ -1090,8 +1105,8 @@ impl MemfdBacking {
         for &(start, size) in regions {
             assert!(
                 start >= next_guest_addr,
-                "memfd-backed region at {:#x} allocated after a region ending at {:#x}:\
-                 regions should be allocated in increasing order.",
+                "memfd-backed region at {:#x} allocated after a region ending at {:#x}:regions \
+                 should be allocated in increasing order.",
                 start.0,
                 next_guest_addr.0
             );
@@ -2841,8 +2856,8 @@ mod tests {
 
     #[test]
     fn test_guest_region_alignment_and_size_normal() {
-        // Note: this covers both the huge_pages = None and THP cases. That's because both allocate the underlying
-        // memory using the host page size (e.g. 4KiB).
+        // Note: this covers both the huge_pages = None and THP cases. That's because both allocate
+        // the underlying memory using the host page size (e.g. 4KiB).
         test_guest_region_alignment_and_size(host_page_size(), 0);
     }
 
@@ -2903,8 +2918,8 @@ mod tests {
                     )
                 });
                 let vma_size = vma_end - vma_start;
-                // Note: the kernel might merge our VMA with a neighbor, we can only check that our region is
-                // contained within the (larger) merged VMA.
+                // Note: the kernel might merge our VMA with a neighbor, we can only check that our
+                // region is contained within the (larger) merged VMA.
                 assert!(
                     vma_start <= addr,
                     "VMA start mismatch for base={base:#x} offset={offset}"

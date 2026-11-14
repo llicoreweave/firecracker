@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
 use std::fmt::Debug;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -132,7 +132,7 @@ impl PciBus {
 }
 
 /// Maximum number of PCI buses
-pub const MAX_PCI_BUSES: u8 = 32;
+pub const MAX_PCI_BUSES: u8 = 64;
 
 /// ECAM space for a single PCI bus: 4096 bytes of configuration space for each
 /// of the 8 functions of each of the 32 devices that can sit on it.
@@ -148,10 +148,10 @@ pub const PCI_MMIO_CONFIG_SIZE_PER_SEGMENT: u64 =
 ///
 /// Secondary buses are numbered from 1 in provisioning order, independently of
 /// the slots the root ports occupy on bus 0, so for example a root port at
-/// 00:04.0 may start bus 1.
+/// 00:04.0 may start bus 1. Static topologies supply their bus numbers explicitly.
 #[derive(Debug)]
 pub struct PciBuses {
-    buses: Box<[Arc<Mutex<PciBus>>]>,
+    buses: Box<[OnceLock<Arc<Mutex<PciBus>>>]>,
 }
 
 impl PciBuses {
@@ -162,27 +162,39 @@ impl PciBuses {
             "PCI segment cannot have more than {} secondary buses",
             MAX_PCI_BUSES - 1
         );
-        let count = usize::from(secondary_buses) + 1;
-        PciBuses {
-            buses: (0..count)
-                .map(|_| Arc::new(Mutex::new(PciBus::default())))
-                .collect(),
+        let buses = Self {
+            buses: (0..MAX_PCI_BUSES).map(|_| OnceLock::new()).collect(),
+        };
+        for bus in 0..=secondary_buses {
+            buses.add_bus(bus).expect("validated bus number");
         }
+        buses
+    }
+
+    /// Materialize a bus specified by a validated cold-boot topology.
+    pub fn add_bus(&self, number: u8) -> Result<(), PciBusError> {
+        self.buses
+            .get(usize::from(number))
+            .ok_or(PciBusError::InvalidBusNumber(number))?
+            .get_or_init(|| Arc::new(Mutex::new(PciBus::default())));
+        Ok(())
     }
 
     /// Look up the bus with the given number
     pub fn get(&self, bus_number: u8) -> Option<&Arc<Mutex<PciBus>>> {
-        self.buses.get(usize::from(bus_number))
+        self.buses
+            .get(usize::from(bus_number))
+            .and_then(OnceLock::get)
     }
 
     /// Return the primary / root bus
     pub fn root_bus(&self) -> &Arc<Mutex<PciBus>> {
-        &self.buses[0]
+        self.get(0).expect("root bus exists")
     }
 
-    /// Total Number of buses in the segment, including the primary.
+    /// Number of ECAM bus slots up to the highest materialized bus, including gaps.
     pub fn num_buses(&self) -> u8 {
-        u8::try_from(self.buses.len()).expect("MAX_PCI_BUSES does not fit in a u8")
+        u8::try_from(self.buses.iter().rposition(|b| b.get().is_some()).unwrap() + 1).unwrap()
     }
 }
 
@@ -528,6 +540,21 @@ mod tests {
         fn read_config_register(&mut self, reg_idx: u16) -> u32 {
             self.0.read_reg(reg_idx)
         }
+    }
+
+    #[test]
+    fn test_sparse_buses_preserve_hotplug_numbering() {
+        let buses = PciBuses::new(1);
+        assert!(buses.get(0).is_some());
+        assert!(buses.get(1).is_some());
+        assert_eq!(buses.num_buses(), 2);
+        buses.add_bus(40).unwrap();
+        assert!(buses.get(40).is_some());
+        assert!(buses.get(2).is_none());
+        assert_eq!(buses.num_buses(), 41);
+        buses.add_bus(40).unwrap();
+        buses.add_bus(super::MAX_PCI_BUSES).unwrap_err();
+        assert_eq!(buses.num_buses(), 41);
     }
 
     #[test]

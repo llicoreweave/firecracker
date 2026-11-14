@@ -1568,6 +1568,9 @@ def test_get_full_config_after_restoring_snapshot(microvm_factory, uvm_configure
         }
     ]
 
+    # No VFIO passthrough devices are configured.
+    setup_cfg["vfio"] = []
+
     # Add a memory balloon device.
     uvm_configured.api.balloon.put(amount_mib=1, deflate_on_oom=True)
     setup_cfg["balloon"] = {
@@ -1769,6 +1772,9 @@ def test_get_full_config(uvm):
             "rate_limiter": None,
         }
     ]
+
+    # No VFIO passthrough devices are configured.
+    expected_cfg["vfio"] = []
 
     # Add a memory balloon device.
     test_microvm.api.balloon.put(amount_mib=1, deflate_on_oom=True)

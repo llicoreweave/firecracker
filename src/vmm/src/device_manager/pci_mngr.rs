@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use event_manager::{MutEventSubscriber, SubscriberOps};
@@ -13,6 +14,9 @@ use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
 use crate::devices::pci::root_port::{PciRootPortRestoreError, PciRootPortState};
+use crate::devices::vfio::VfioContext;
+use crate::devices::vfio::VfioError;
+use crate::devices::vfio::pci::{BarRequirement, BarSlot, BarWindow, VfioPciDevice, VfioPciError};
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonConstructorArgs;
 use crate::devices::virtio::block::device::Block;
@@ -43,6 +47,7 @@ use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vstate::bus::BusError;
 use crate::vstate::interrupts::InterruptError;
 use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::KvmVm;
 
 /// Where on the PCI topology a virtio device should be placed.
@@ -60,6 +65,10 @@ pub struct PciDevices {
     pub pci_segment: PciSegment,
     /// All VirtIO PCI devices of the system
     pub virtio_devices: HashMap<VirtioDeviceId, Arc<Mutex<VirtioPciDevice>>>,
+    /// All VFIO passthrough PCI devices of the system, keyed by their Firecracker id.
+    pub vfio_devices: HashMap<String, Arc<Mutex<VfioPciDevice>>>,
+    /// The IOMMU context shared by the VFIO devices, if any is attached.
+    pub vfio_context: Option<VfioContext>,
 }
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -92,6 +101,10 @@ pub enum PciManagerError {
     /// The snapshot's PCIe root port at index {0} is inconsistent: it is at
     /// {1} and starts bus {2}.
     InconsistentRootPort(usize, PciSBDF, u8),
+    /// VFIO error: {0}
+    Vfio(#[from] VfioError),
+    /// VFIO PCI device error: {0}
+    VfioPci(#[from] VfioPciError),
 }
 
 impl PciDevices {
@@ -103,6 +116,8 @@ impl PciDevices {
         Ok(Self {
             pci_segment,
             virtio_devices: HashMap::new(),
+            vfio_devices: HashMap::new(),
+            vfio_context: None,
         })
     }
 
@@ -312,6 +327,138 @@ impl PciDevices {
         }
     }
 
+    /// Assign the host PCI functions described by `configs`, pairs of a Firecracker id and the
+    /// host sysfs path of the function (e.g. `/sys/bus/pci/devices/0000:01:00.0`), to the guest.
+    ///
+    /// All functions are attached at once: they share one IOMMU context, and the BARs of all of
+    /// them are placed together, largest first and from the top of each MMIO window, which packs
+    /// naturally aligned power-of-two BARs without fragmentation and keeps them clear of the
+    /// virtio-pci BARs allocated from the bottom of the window.
+    pub(crate) fn attach_vfio_devices(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        configs: &[(String, &Path)],
+    ) -> Result<(), PciManagerError> {
+        if configs.is_empty() {
+            return Ok(());
+        }
+        // Only one attach is supported: all the devices must share a single IOMMU context.
+        assert!(self.vfio_context.is_none());
+
+        let paths: Vec<&Path> = configs.iter().map(|&(_, path)| path).collect();
+        let (context, opened) = VfioContext::new(vm, &paths)?;
+        self.add_vfio_devices(
+            vm,
+            configs.iter().zip(opened).map(|((id, _), opened)| {
+                move |sbdf: PciSBDF| VfioPciDevice::new(id.clone(), sbdf, opened, vm.clone())
+            }),
+        )?;
+        self.vfio_context = Some(context);
+
+        Ok(())
+    }
+
+    /// Add passthrough devices to the PCI bus, each built by its constructor at the SBDF it is
+    /// given, then place and map the BARs of all of them.
+    fn add_vfio_devices<F>(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        constructors: impl IntoIterator<Item = F>,
+    ) -> Result<(), PciManagerError>
+    where
+        F: FnOnce(PciSBDF) -> Result<VfioPciDevice, VfioPciError>,
+    {
+        let mut devices = Vec::new();
+        let mut intx_gsis = IntxGsis::default();
+        for constructor in constructors {
+            // The bus does not reserve the device ID it hands out: each device is added to the
+            // bus before the next ID is taken.
+            let sbdf = self.pci_segment.next_device_sbdf()?;
+            let mut device = constructor(sbdf)?;
+            debug!("Allocating SBDF: {sbdf:?} for VFIO device {}", device.id());
+            if device.supports_intx() {
+                let gsi = intx_gsis.next(&mut vm.resource_allocator())?;
+                debug!("vfio: routing INTx of {} to GSI {gsi}", device.id());
+                device.route_intx(gsi)?;
+            }
+            let device = Arc::new(Mutex::new(device));
+            self.pci_segment
+                .pci_buses
+                .get(0)
+                .unwrap()
+                .lock()
+                .expect("Poisoned lock")
+                .add_device(sbdf.device(), device.clone())?;
+            devices.push(device);
+        }
+
+        let requirements: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .flat_map(|(device, vfio)| {
+                vfio.lock()
+                    .expect("Poisoned lock")
+                    .bar_requirements()
+                    .into_iter()
+                    .map(move |requirement| (device, requirement))
+            })
+            .collect();
+        let placements = place_vfio_bars(&mut vm.resource_allocator(), requirements)?;
+        for (device, slot, guest_addr) in placements {
+            devices[device]
+                .lock()
+                .expect("Poisoned lock")
+                .place_bar(slot, guest_addr);
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            // The ACPI PCI routing table of the segment maps INTA of each slot to its GSI.
+            let pci_segment = &mut self.pci_segment;
+            for device in &devices {
+                let vfio = device.lock().expect("Poisoned lock");
+                if let Some(gsi) = vfio.intx_gsi() {
+                    pci_segment.pci_irq_slots[usize::from(vfio.sbdf().device())] =
+                        u8::try_from(gsi).expect("x86 legacy GSIs fit in a byte");
+                }
+            }
+        }
+
+        for device in devices {
+            let (id, ranges) = {
+                let mut vfio = device.lock().expect("Poisoned lock");
+                vfio.map_bars()?;
+                (vfio.id().to_string(), vfio.mmio_ranges())
+            };
+            for (base, len) in ranges {
+                debug!("vfio: trapping BAR range {base:#x}:{len:#x} on the MMIO bus");
+                vm.common.mmio_bus.insert(device.clone(), base, len)?;
+            }
+            self.vfio_devices.insert(id, device);
+        }
+
+        Ok(())
+    }
+
+    /// Whether any VFIO passthrough device is currently attached.
+    pub fn has_vfio_devices(&self) -> bool {
+        !self.vfio_devices.is_empty()
+    }
+
+    /// The `(slot, GSI)` routes of the INTA pins of the devices on the PCI bus, by slot.
+    pub fn intx_routes(&self) -> Vec<(u8, u32)> {
+        let mut routes: Vec<(u8, u32)> = self
+            .vfio_devices
+            .values()
+            .filter_map(|device| {
+                let device = device.lock().expect("Poisoned lock");
+                device.intx_gsi().map(|gsi| (device.sbdf().device(), gsi))
+            })
+            .collect();
+        routes.sort_unstable();
+        routes
+    }
+
     fn restore_pci_device<T: 'static + VirtioDevice + MutEventSubscriber + Debug>(
         &mut self,
         vm: &Arc<KvmVm>,
@@ -389,6 +536,67 @@ impl PciDevices {
             f(*device_type, &mut *device);
         }
     }
+}
+
+/// First GSI INTx pins are routed to. On x86, the IOAPIC inputs from 16 up: KVM also wires GSIs 0
+/// to 15 to the 8259 PIC, and PC chipsets route PCI interrupts to inputs 16 to 23 as well.
+#[cfg(target_arch = "x86_64")]
+const INTX_GSI_START: u32 = 16;
+#[cfg(target_arch = "aarch64")]
+const INTX_GSI_START: u32 = crate::arch::GSI_LEGACY_START;
+
+/// The GSIs the INTx pins of passthrough devices are routed to: a GSI of its own for each device
+/// while free ones are left, then the GSIs already used, in turn. INTx is level-triggered, so
+/// devices can share a GSI, as they share interrupt lines on physical platforms.
+#[derive(Debug, Default)]
+struct IntxGsis {
+    own: Vec<u32>,
+    shared: usize,
+}
+
+impl IntxGsis {
+    fn next(&mut self, allocator: &mut ResourceAllocator) -> Result<u32, vm_allocator::Error> {
+        match allocator.allocate_gsi_legacy_from(INTX_GSI_START) {
+            Ok(gsi) => {
+                self.own.push(gsi);
+                Ok(gsi)
+            }
+            Err(err) if self.own.is_empty() => Err(err),
+            Err(_) => {
+                let gsi = self.own[self.shared % self.own.len()];
+                self.shared += 1;
+                Ok(gsi)
+            }
+        }
+    }
+}
+
+/// Choose the guest addresses of VFIO BARs, given as `(device, requirement)` pairs.
+///
+/// BARs are naturally aligned powers of two. Placing them largest first, each at the highest
+/// suitable address of its window, packs them without fragmentation below the top of the window,
+/// away from the virtio-pci BARs which are allocated from the bottom.
+fn place_vfio_bars(
+    allocator: &mut ResourceAllocator,
+    mut requirements: Vec<(usize, BarRequirement)>,
+) -> Result<Vec<(usize, BarSlot, u64)>, vm_allocator::Error> {
+    // Stable sort: equally sized BARs keep the device and BAR order.
+    requirements.sort_by_key(|(_, requirement)| std::cmp::Reverse(requirement.size));
+    requirements
+        .into_iter()
+        .map(|(device, requirement)| {
+            let window = match requirement.window {
+                BarWindow::Mmio32 => &mut allocator.mmio32_memory,
+                BarWindow::Mmio64 => &mut allocator.mmio64_memory,
+            };
+            let range = window.allocate(
+                requirement.size,
+                requirement.size,
+                vm_allocator::AllocPolicy::LastMatch,
+            )?;
+            Ok((device, requirement.slot, range.start()))
+        })
+        .collect()
 }
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -1028,6 +1236,7 @@ mod tests {
       "rate_limiter": null
     }}
   ],
+  "vfio": [],
   "memory-hotplug": {{
     "total_size_mib": 1024,
     "block_size_mib": 2,
@@ -1156,11 +1365,224 @@ mod tests {
 
         // And a hot-plug into a restored port still works, which is what the
         // MSI-X restore is for.
-        restored_vmm.device_manager.virtio_devices = VirtioDevices::Pci(restored);
+        restored_vmm.device_manager.virtio_devices = VirtioDevices::Pci(Box::new(restored));
         let f = TempFile::new().unwrap();
         let cfg = HotplugDeviceConfig::Block(make_hotplug_block_cfg("hp0", &f, false));
         restored_vmm
             .hotplug_device(cfg, &mut event_manager)
             .unwrap();
+    }
+
+    #[test]
+    fn test_place_vfio_bars() {
+        use crate::arch::{
+            MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START, MEM_64BIT_DEVICES_SIZE,
+            MEM_64BIT_DEVICES_START,
+        };
+        use crate::devices::vfio::pci::{BarRequirement, BarSlot, BarWindow};
+
+        let mut allocator = ResourceAllocator::new();
+        // A virtio-pci BAR, allocated from the bottom of the 32-bit window as
+        // `VirtioPciDevice::allocate_bars` does.
+        let virtio = allocator
+            .mmio32_memory
+            .allocate(
+                CAPABILITY_BAR_SIZE,
+                CAPABILITY_BAR_SIZE,
+                vm_allocator::AllocPolicy::FirstMatch,
+            )
+            .unwrap()
+            .start();
+        let requirement = |slot, size, window| BarRequirement { slot, size, window };
+        let half_window = MEM_64BIT_DEVICES_SIZE / 2;
+        let requirements = vec![
+            (0, requirement(BarSlot::Bar(0), 16 << 20, BarWindow::Mmio32)),
+            (
+                0,
+                requirement(BarSlot::Bar(1), 256 << 20, BarWindow::Mmio64),
+            ),
+            (0, requirement(BarSlot::Bar(3), 32 << 20, BarWindow::Mmio64)),
+            (0, requirement(BarSlot::Rom, 512 << 10, BarWindow::Mmio32)),
+            (1, requirement(BarSlot::Bar(0), 16 << 20, BarWindow::Mmio32)),
+            (
+                1,
+                requirement(BarSlot::Bar(1), half_window, BarWindow::Mmio64),
+            ),
+        ];
+        let placements = place_vfio_bars(&mut allocator, requirements.clone()).unwrap();
+
+        // Largest first; equal sizes keep their order.
+        let order: Vec<(usize, BarSlot)> = placements
+            .iter()
+            .map(|&(device, slot, _)| (device, slot))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (1, BarSlot::Bar(1)),
+                (0, BarSlot::Bar(1)),
+                (0, BarSlot::Bar(3)),
+                (0, BarSlot::Bar(0)),
+                (1, BarSlot::Bar(0)),
+                (0, BarSlot::Rom),
+            ]
+        );
+        // The largest BAR takes the top half of the 64-bit window, the next ones are packed right
+        // below it.
+        let top64 = MEM_64BIT_DEVICES_START + MEM_64BIT_DEVICES_SIZE;
+        assert_eq!(placements[0].2, top64 - half_window);
+        assert_eq!(placements[1].2, top64 - half_window - (256 << 20));
+        assert_eq!(
+            placements[2].2,
+            top64 - half_window - (256 << 20) - (32 << 20)
+        );
+        // The BARs of the 32-bit window are placed from its top, clear of the virtio-pci BAR.
+        for &(_, _, addr) in &placements[3..] {
+            assert!(addr >= virtio + CAPABILITY_BAR_SIZE);
+        }
+        // Every BAR is naturally aligned and inside its window, and no two BARs overlap.
+        for (&(device, slot, addr), i) in placements.iter().zip(0..) {
+            let (_, requirement) = requirements
+                .iter()
+                .find(|(d, r)| *d == device && r.slot == slot)
+                .unwrap();
+            assert_eq!(addr % requirement.size, 0);
+            let (start, size) = match requirement.window {
+                BarWindow::Mmio32 => (MEM_32BIT_DEVICES_START, MEM_32BIT_DEVICES_SIZE),
+                BarWindow::Mmio64 => (MEM_64BIT_DEVICES_START, MEM_64BIT_DEVICES_SIZE),
+            };
+            assert!(addr >= start && addr + requirement.size <= start + size);
+            for &(other_device, other_slot, other_addr) in &placements[i + 1..] {
+                let (_, other) = requirements
+                    .iter()
+                    .find(|(d, r)| *d == other_device && r.slot == other_slot)
+                    .unwrap();
+                assert!(addr + requirement.size <= other_addr || other_addr + other.size <= addr);
+            }
+        }
+
+        // A BAR as large as the whole 64-bit window no longer fits next to the BARs placed in it.
+        let whole_window = vec![(
+            0,
+            requirement(BarSlot::Bar(0), MEM_64BIT_DEVICES_SIZE, BarWindow::Mmio64),
+        )];
+        place_vfio_bars(&mut ResourceAllocator::new(), whole_window.clone()).unwrap();
+        place_vfio_bars(&mut allocator, whole_window).unwrap_err();
+    }
+
+    #[test]
+    fn test_intx_gsis() {
+        use crate::arch::GSI_LEGACY_END;
+
+        let mut allocator = ResourceAllocator::new();
+        let mut gsis = IntxGsis::default();
+        // Each device gets a GSI of its own from INTX_GSI_START while some are free...
+        let own: Vec<u32> = (INTX_GSI_START..=GSI_LEGACY_END)
+            .map(|_| gsis.next(&mut allocator).unwrap())
+            .collect();
+        assert_eq!(own, (INTX_GSI_START..=GSI_LEGACY_END).collect::<Vec<_>>());
+        // ...then they share the GSIs, in turn.
+        let shared: Vec<u32> = (0..own.len() + 1)
+            .map(|_| gsis.next(&mut allocator).unwrap())
+            .collect();
+        assert_eq!(shared[..own.len()], own);
+        assert_eq!(shared[own.len()], own[0]);
+        // With no GSI at all, routing fails.
+        let mut allocator = ResourceAllocator::new();
+        while allocator.allocate_gsi_legacy(1).is_ok() {}
+        IntxGsis::default().next(&mut allocator).unwrap_err();
+    }
+
+    #[test]
+    fn test_add_vfio_devices() {
+        use crate::devices::vfio::pci::tests::{mock_vfio_device, setup_vm_with_irqchip};
+
+        let vm = Arc::new(setup_vm_with_irqchip());
+        let mut pci_devices = PciDevices::new(&vm, 0).unwrap();
+        let first = pci_devices.pci_segment.next_device_sbdf().unwrap().device();
+
+        // The bus does not reserve the device IDs it hands out, yet every device gets a slot of
+        // its own, as all the functions of an IOMMU group attached to one microVM need.
+        let ids = ["gpu0", "audio0"];
+        pci_devices
+            .add_vfio_devices(
+                &vm,
+                ids.map(|id| {
+                    let vm = vm.clone();
+                    move |sbdf| Ok(mock_vfio_device(id, sbdf, vm))
+                }),
+            )
+            .unwrap();
+        let slot_of = |id: &str| pci_devices.vfio_devices[id].lock().unwrap().sbdf().device();
+        assert_eq!(ids.map(&slot_of), [first, first + 1]);
+        {
+            let bus = pci_devices.pci_segment.pci_buses.root_bus().lock().unwrap();
+            for id in ids {
+                assert!(bus.get_device(slot_of(id)).is_some());
+            }
+        }
+        assert_eq!(
+            pci_devices.pci_segment.next_device_sbdf().unwrap().device(),
+            first + 2
+        );
+
+        // Each INTA pin is routed to a GSI of its own, for the slot of its device.
+        let routes = pci_devices.intx_routes();
+        let slots: Vec<u8> = routes.iter().map(|&(slot, _)| slot).collect();
+        assert_eq!(slots, [first, first + 1]);
+        assert_ne!(routes[0].1, routes[1].1);
+        #[cfg(target_arch = "x86_64")]
+        for (slot, gsi) in routes {
+            let pci_irq_slot = pci_devices.pci_segment.pci_irq_slots[usize::from(slot)];
+            assert_eq!(u32::from(pci_irq_slot), gsi);
+        }
+
+        // The BARs of the devices do not overlap.
+        let mut ranges: Vec<(u64, u64)> = pci_devices
+            .vfio_devices
+            .values()
+            .flat_map(|device| device.lock().unwrap().mmio_ranges())
+            .collect();
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{pair:x?}");
+        }
+    }
+
+    #[test]
+    fn test_virtio_attach_without_mmio32_space() {
+        use crate::devices::virtio::rng::Entropy;
+        use crate::devices::virtio::transport::pci::device::CAPABILITY_BAR_SIZE;
+        use crate::rate_limiter::RateLimiter;
+
+        let mut vmm = default_vmm_with_pci();
+        let vm = vmm.vm.as_kvm().unwrap().clone();
+        // Passthrough BARs can take all the room left in the 32-bit MMIO window.
+        {
+            let mut allocator = vm.resource_allocator();
+            while allocator
+                .mmio32_memory
+                .allocate(
+                    CAPABILITY_BAR_SIZE,
+                    CAPABILITY_BAR_SIZE,
+                    vm_allocator::AllocPolicy::FirstMatch,
+                )
+                .is_ok()
+            {}
+        }
+
+        // A virtio-pci device then fails to attach, without bringing the VMM down.
+        let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
+        let mut event_manager = EventManager::new().unwrap();
+        let err = device_manager::tests::pci_devices_mut(&mut vmm.device_manager)
+            .attach_pci_virtio_device(
+                &vm,
+                "rng".to_string(),
+                entropy,
+                &mut event_manager,
+                PciPlacement::PrimaryBus,
+            )
+            .unwrap_err();
+        assert!(matches!(err, PciManagerError::VirtioPciDevice(_)), "{err}");
     }
 }

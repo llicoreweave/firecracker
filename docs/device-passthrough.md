@@ -65,33 +65,32 @@ be used by one microVM at a time.
 Passthrough devices are configured before the microVM starts. A device is
 referenced by the path of its sysfs directory.
 
-Using the API:
-
-```bash
-curl --unix-socket "${API_SOCKET}" -i \
-    -X PUT 'http://localhost/vfio/gpu0' \
-    -H 'Content-Type: application/json' \
-    -d '{
-        "id": "gpu0",
-        "path": "/sys/bus/pci/devices/0000:01:00.0"
-    }'
-```
-
-Using a JSON configuration file (`--config-file`), add a `vfio` array:
+Use a JSON configuration file (`--config-file`) containing both `pci-topology`
+and `vfio`. The runtime chooses every guest PCI address before launching the
+VMM; Firecracker does not infer placement from host PCI ancestry or NUMA nodes.
+The current static topology mode requires x86_64 KVM.
 
 ```json
 {
+  "pci-topology": {
+    "roots": [{"bus": 0, "last_bus": 0}],
+    "bridges": []
+  },
   "vfio": [
     {
       "id": "gpu0",
-      "path": "/sys/bus/pci/devices/0000:01:00.0"
+      "path": "/sys/bus/pci/devices/0000:01:00.0",
+      "pci_address": {"bus": 0, "device": 16, "function": 0}
     }
   ]
 }
 ```
 
-In the guest, each assigned function shows up as a single-function PCIe endpoint
-on bus 0, and the matching guest driver binds to it.
+Merge this fragment with the boot source, machine and drive configuration.
+The endpoint appears at `0000:00:10.0` in the guest. For multiple roots,
+bridges and optional NUMA affinity, see [PCI topology](pci-numa.md).
+The preboot `/vfio/{id}` API only describes an endpoint; it does not supply
+its required PCI graph. Use the configuration file to boot passthrough VMs.
 
 ### Running with the jailer
 
@@ -105,7 +104,8 @@ repeated, and with `--resource-limit memlock=<bytes>`:
 jailer --id vm0 --exec-file /usr/bin/firecracker --uid 123 --gid 100 \
     --vfio-device /sys/bus/pci/devices/0000:01:00.0 \
     --resource-limit memlock=$((4 << 30)) \
-    -- --enable-pci --api-sock /run/firecracker.socket
+    -- --enable-pci --config-file /vm-config.json \
+    --api-sock /run/firecracker.socket
 ```
 
 The jailer recreates `/dev/vfio/vfio`, the `/dev/vfio/<group>` node of each
@@ -159,7 +159,8 @@ host); nothing else of the host sysfs is exposed.
 
 ## Limitations
 
-- Passthrough requires `--enable-pci`, and devices can only be configured before
+- Static passthrough requires x86_64 KVM, `--enable-pci` and a configured
+  PCI graph. Devices can only be configured before
   boot: hot-plugging and hot-unplugging are not supported.
 - A microVM with a passthrough device cannot be
   [snapshotted](snapshotting/snapshot-support.md): the device state lives in the

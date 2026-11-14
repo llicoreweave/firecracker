@@ -55,7 +55,6 @@ use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError};
 use crate::vmm_config::memory_hotplug::MemoryHotplugConfig;
 use crate::vmm_config::pmem::PmemConfig;
-use crate::vmm_config::vfio::VfioDeviceConfig;
 use crate::vstate::kvm::{Kvm, KvmError};
 use crate::vstate::memory::GuestRegionMmap;
 use crate::vstate::resources::ResourceAllocator;
@@ -326,7 +325,7 @@ pub fn build_microvm_for_boot(
         &vm_resources.pmem.configs,
         event_manager,
     )?;
-    attach_vfio_devices(&mut device_manager, &vm, &vm_resources.vfio.configs)?;
+    attach_vfio_devices(&mut device_manager, &vm, vm_resources)?;
 
     if let Some(unix_vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(
@@ -865,8 +864,12 @@ fn attach_pmem_devices(
 fn attach_vfio_devices(
     device_manager: &mut DeviceManager,
     vm: &Vm,
-    configs: &[VfioDeviceConfig],
+    resources: &VmResources,
 ) -> Result<(), StartMicrovmError> {
+    let configs = &resources.vfio.configs;
+    if let Some(topology) = &resources.pci_topology {
+        device_manager.configure_static_topology(topology, configs)?;
+    }
     let configs: Vec<(String, &std::path::Path)> = configs
         .iter()
         .map(|config| (config.id.clone(), std::path::Path::new(&config.path)))
@@ -955,6 +958,7 @@ pub(crate) mod tests {
     use crate::vmm_config::machine_config::MachineConfig;
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::pmem::{PmemBuilder, PmemConfig};
+    use crate::vmm_config::vfio::VfioDeviceConfig;
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
     use crate::vstate::vm::Vm;
@@ -1698,7 +1702,6 @@ pub(crate) mod tests {
     #[test]
     fn test_validate_vfio_config() {
         use crate::vmm_config::balloon::BalloonBuilder;
-        use crate::vmm_config::vfio::VfioDeviceConfig;
 
         let mut resources = VmResources {
             // The test default configures a balloon.
@@ -1713,6 +1716,7 @@ pub(crate) mod tests {
             .insert(VfioDeviceConfig {
                 id: "gpu0".to_string(),
                 path: "/sys/bus/pci/devices/0000:01:00.0".to_string(),
+                ..Default::default()
             })
             .unwrap();
         assert!(matches!(

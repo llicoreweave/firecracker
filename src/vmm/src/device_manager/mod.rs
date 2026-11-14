@@ -315,6 +315,19 @@ impl DeviceManager {
     }
 
     /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
+    pub(crate) fn configure_static_topology(
+        &mut self,
+        topology: &crate::vmm_config::pci_topology::PciTopologyConfig,
+        configs: &[crate::vmm_config::vfio::VfioDeviceConfig],
+    ) -> Result<(), AttachDeviceError> {
+        let VirtioDevices::Pci(pci) = &mut self.virtio_devices else {
+            return Err(AttachDeviceError::PciNotEnabled);
+        };
+        pci.configure_static_topology(topology, configs)?;
+        Ok(())
+    }
+
+    /// Assigns the host PCI functions `configs`, given as `(id, sysfs path)`, to the VM.
     pub(crate) fn attach_vfio_devices(
         &mut self,
         vm: &Vm,
@@ -1248,9 +1261,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_unplug_marks_used_rings_dirty() {
-        use crate::arch::host_page_size;
         use vm_memory::GuestMemoryBackend;
 
+        use crate::arch::host_page_size;
         use crate::devices::virtio::block::device::Block;
         use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt};
         use crate::test_utils::single_region_mem_dirty_tracking;

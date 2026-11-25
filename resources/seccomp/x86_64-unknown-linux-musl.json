@@ -2000,6 +2000,31 @@
             {
                 "syscall": "pwrite64",
                 "comment": "Used by VFIO passthrough to write device PCI config and BAR regions on vCPU MMIO/PIO exits"
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15214,
+                        "comment": "VFIO_DEVICE_SET_IRQS for guest MSI enable and disable"
+                    }
+                ]
+            },
+            {
+                "syscall": "poll",
+                "comment": "Read pending MSI eventfds without consuming events",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 0,
+                        "comment": "Only zero-timeout readiness queries"
+                    }
+                ]
             }
         ]
     },

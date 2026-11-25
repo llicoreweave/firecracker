@@ -1,6 +1,8 @@
 // Copyright 2026 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod msi;
+
 use std::ops::DerefMut;
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -18,7 +20,6 @@ pub use vfio_ioctls::{
 };
 use vm_allocator::{AddressAllocator, AllocPolicy, RangeInclusive};
 use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
-use vmm_sys_util::eventfd::EventFd;
 use zerocopy::IntoBytes;
 
 use crate::arch::host_page_size;
@@ -70,6 +71,8 @@ pub enum VfioError {
     VfioIoctls(#[from] vfio_ioctls::VfioError),
     /// Cannot create Msix vector group: {0}
     MsixConfig(#[from] InterruptError),
+    /// Device provides neither usable MSI nor MSI-X interrupts
+    NoSupportedIrq,
     /// Device does not provide MSIx irq
     NoMsixIrq,
     /// KVM failed to create KVM_DEV_TYPE_VFIO device: {0}
@@ -277,7 +280,8 @@ pub struct VfioDevice {
     bar_mappings: Vec<VfioBarMapping>,
     /// Areas of the BARs which are emulated instead of being mapped into the guest.
     pub emulated_areas: VfioBarEmulatedAreas,
-    msix_state: VfioMsixState,
+    msix_state: Option<VfioMsixState>,
+    msi_state: Option<msi::MsiState>,
     masks: Vec<VfioRegisterMask>,
     vm: Arc<KvmVm>,
 }
@@ -300,6 +304,29 @@ impl VfioDevice {
         sbdf: PciSBDF,
     ) -> Result<VfioDevice, VfioError> {
         vfio_init_device(container, vm, config, sbdf)
+    }
+
+    fn distribute_access(&self, base: u64, offset: u64, len: usize) -> HandleBarAccessResult {
+        if let Some(msix) = &self.msix_state {
+            vfio_distribute_emulated_access(
+                &self.emulated_areas,
+                &msix.cap,
+                base,
+                offset,
+                usize_to_u64(len),
+            )
+        } else {
+            let area = self
+                .emulated_areas
+                .iter()
+                .find(|a| a.gpa == base)
+                .expect("access targets a registered BAR");
+            assert!(offset + usize_to_u64(len) <= area.size);
+            HandleBarAccessResult::Device {
+                bar_idx: area.bar_idx,
+                offset,
+            }
+        }
     }
 
     fn maybe_relocate_all_bars(&mut self) {
@@ -390,13 +417,7 @@ fn vfio_distribute_emulated_access(
 
 impl BusDevice for VfioDevice {
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
-        match vfio_distribute_emulated_access(
-            &self.emulated_areas,
-            &self.msix_state.cap,
-            base,
-            offset,
-            usize_to_u64(data.len()),
-        ) {
+        match self.distribute_access(base, offset, data.len()) {
             HandleBarAccessResult::PartialOverlap => {
                 warn!(
                     "[{}] BusDevice::read ignoring read with partial overlap: base: {base:#x} \
@@ -406,7 +427,11 @@ impl BusDevice for VfioDevice {
                 data.fill(0);
             }
             HandleBarAccessResult::MsixTable(offset) => {
-                self.msix_state.config.read_table(offset, data);
+                self.msix_state
+                    .as_mut()
+                    .unwrap()
+                    .config
+                    .read_table(offset, data);
             }
             HandleBarAccessResult::Device { bar_idx, offset } => {
                 let region_size = self.device.get_region_size(bar_idx as u32);
@@ -419,13 +444,7 @@ impl BusDevice for VfioDevice {
     }
 
     fn write(&mut self, base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        match vfio_distribute_emulated_access(
-            &self.emulated_areas,
-            &self.msix_state.cap,
-            base,
-            offset,
-            usize_to_u64(data.len()),
-        ) {
+        match self.distribute_access(base, offset, data.len()) {
             HandleBarAccessResult::PartialOverlap => {
                 warn!(
                     "[{}] BusDevice::write ignoring write with partial overlap: base: {base:#x} \
@@ -434,7 +453,11 @@ impl BusDevice for VfioDevice {
                 );
             }
             HandleBarAccessResult::MsixTable(offset) => {
-                self.msix_state.config.write_table(offset, data);
+                self.msix_state
+                    .as_mut()
+                    .unwrap()
+                    .config
+                    .write_table(offset, data);
             }
             HandleBarAccessResult::Device { bar_idx, offset } => {
                 let region_size = self.device.get_region_size(bar_idx as u32);
@@ -489,6 +512,12 @@ impl PciDevice for VfioDevice {
         offset: u8,
         data: &[u8],
     ) -> Option<Arc<Barrier>> {
+        if let Some(msi) = &mut self.msi_state
+            && msi.contains(reg_idx)
+        {
+            msi.write(&self.device, reg_idx, offset, data);
+            return None;
+        }
         let mut handled: bool = false;
         if BAR0_REG_IDX <= reg_idx && reg_idx < BAR0_REG_IDX + u16::from(NUM_BAR_REGS) {
             // reg_idx is in [BAR0_REG, BAR0_REG+NUM_BAR_REGS), so the difference is 0..5.
@@ -524,9 +553,17 @@ impl PciDevice for VfioDevice {
                  {offset:#x}",
                 self.config.id
             );
-        } else if reg_idx == u16::from(self.msix_state.register) {
+        } else if self
+            .msix_state
+            .as_ref()
+            .is_some_and(|msix| reg_idx == u16::from(msix.register))
+        {
             // offset is within a 4-byte PCI config register (0..3).
-            self.msix_state.config.write_msg_ctl_register(offset, data);
+            self.msix_state
+                .as_mut()
+                .unwrap()
+                .config
+                .write_msg_ctl_register(offset, data);
             // Don't set `handled` since we need to passthrough write
             // to the msg_ctl register to the device, so it will enable Msix
             // interrupts
@@ -555,6 +592,11 @@ impl PciDevice for VfioDevice {
         None
     }
     fn read_config_register(&mut self, reg_idx: u16) -> u32 {
+        if let Some(msi) = &self.msi_state
+            && msi.contains(reg_idx)
+        {
+            return msi.read(reg_idx);
+        }
         let mut result: u32 = 0;
         if BAR0_REG_IDX <= reg_idx && reg_idx < BAR0_REG_IDX + u16::from(NUM_BAR_REGS) {
             // reg_idx is in [BAR0_REG, BAR0_REG+NUM_BAR_REGS), so the difference is 0..5.
@@ -574,10 +616,14 @@ impl PciDevice for VfioDevice {
                 result.as_mut_bytes(),
                 config_offset,
             );
-            if reg_idx == u16::from(self.msix_state.register) {
+            if self
+                .msix_state
+                .as_ref()
+                .is_some_and(|msix| reg_idx == u16::from(msix.register))
+            {
                 // Since we emulate the MsixCap, we need to set the Mask and Msix enable bits to
                 // values we have, and not what device has.
-                let msg_ctl = self.msix_state.config.as_msg_ctl();
+                let msg_ctl = self.msix_state.as_ref().unwrap().config.as_msg_ctl();
                 result &= 0x0000ffff;
                 result |= u32::from(msg_ctl) << 16;
             }
@@ -947,10 +993,19 @@ fn vfio_ranges_overlap(start_a: u64, size_a: u64, start_b: u64, size_b: u64) -> 
 ///
 /// BARs which the kernel does not allow us to mmap (or the page with the MSIx table in them) or
 /// which are smaller than the host page size have no mmappable areas.
+#[cfg(test)]
 fn vfio_calculate_bar_areas(
     bars: &Bars,
+    infos: &[VfioBarInfo; NUM_BAR_REGS as usize],
+    cap: &MsixCap,
+) -> Result<(Vec<VfioBarMappableArea>, VfioBarEmulatedAreas), VfioError> {
+    vfio_calculate_bar_areas_optional(bars, infos, Some(cap))
+}
+
+fn vfio_calculate_bar_areas_optional(
+    bars: &Bars,
     bar_infos: &[VfioBarInfo; NUM_BAR_REGS as usize],
-    msix_cap: &MsixCap,
+    msix_cap: Option<&MsixCap>,
 ) -> Result<(Vec<VfioBarMappableArea>, VfioBarEmulatedAreas), VfioError> {
     // There are 6 BARs with maximum of 1 MSIx table gap, so the maximum number of mappable areas
     // is 7. The only reason to use `Vec` instead of `ArrayVec` here is that this vector can be
@@ -982,10 +1037,10 @@ fn vfio_calculate_bar_areas(
             let mut msix_table_offset = 0;
             let mut msix_table_size = 0;
             let mut msix_table_gpa = 0;
-            let contains_msix_table = bar_idx == msix_cap.table_bir();
+            let contains_msix_table = msix_cap.is_some_and(|cap| bar_idx == cap.table_bir());
 
             if contains_msix_table {
-                let (offset, size) = msix_cap.table_bar_offset_and_size();
+                let (offset, size) = msix_cap.unwrap().table_bar_offset_and_size();
                 // Since original `offset` and `size` are `u32` and `u16`, their addition
                 // cannot overflow when widened to `u64`;
                 let (offset, size) = (offset as u64, size as u64);
@@ -1378,41 +1433,33 @@ fn vfio_finish_device(
         device,
         bar_infos,
     } = prepared;
-    let Some(msix_irq_info) = device.get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX) else {
-        return Err(VfioError::NoMsixIrq);
-    };
-    if msix_irq_info.count == 0 {
-        return Err(VfioError::NoMsixIrq);
-    }
-
     let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
     device.region_read(VFIO_PCI_CONFIG_REGION_INDEX, config_space.as_mut_bytes(), 0);
     let (msix_cap_and_register, masks) = vfio_get_pci_capabilities(&config_space);
-
-    // Only devices with MSI-X cap and irqs are supported
-    let Some((msix_cap, msix_register)) = msix_cap_and_register else {
-        return Err(VfioError::NoMsixIrq);
+    let (msix_state, msi_state) = match (
+        msix_cap_and_register,
+        device.get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX),
+    ) {
+        (Some((cap, register)), Some(info)) if info.count != 0 => {
+            let count =
+                u16::try_from(info.count.min(u32::from((cap.msg_ctl & 0x7ff) + 1))).unwrap();
+            let vectors = Arc::new(KvmVm::create_msix_group(vm.clone(), count)?);
+            let config = MsixConfig::new(vectors, sbdf);
+            device.enable_msix(config.vectors.vectors.iter().map(|v| &v.event_fd).collect())?;
+            (
+                Some(VfioMsixState {
+                    register,
+                    cap,
+                    config,
+                }),
+                None,
+            )
+        }
+        _ => (
+            None,
+            Some(msi::MsiState::new(&config_space, &device, vm, sbdf)?),
+        ),
     };
-
-    // SAFETY: maximum msix table size is 1 << 11 = 2048 (it has 10 bits in the control register
-    // and encoded as N - 1). This fits into u16 without issues.
-    #[allow(clippy::cast_possible_truncation)]
-    let msix_num = msix_irq_info.count as u16;
-    let msix_vectors =
-        KvmVm::create_msix_group(vm.clone(), msix_num).map_err(VfioError::MsixConfig)?;
-    let msix_config = MsixConfig::new(Arc::new(msix_vectors), sbdf);
-
-    // We set VFIO irqs here on device setup. There is no reason to add additional tracking
-    // for driver MSIx configuration since those are handled by the MsixState.
-    // If anything after this call fails, we don't need to do anything since the kernel will
-    // clean up these irqs when `device` file will be closed.
-    let fds: Vec<&EventFd> = msix_config
-        .vectors
-        .vectors
-        .iter()
-        .map(|v| &v.event_fd)
-        .collect();
-    device.enable_msix(fds)?;
 
     // There is no direct access to `regions` in `VfioDevice`, so need to work around this
     let bars = match allocated {
@@ -1424,11 +1471,16 @@ fn vfio_finish_device(
         None => VfioBars::new(vm.clone(), &bar_infos)?,
     };
 
-    let (areas, emulated_areas) = vfio_calculate_bar_areas(&bars.vmm_bars, &bar_infos, &msix_cap)?;
-    if !emulated_areas
-        .iter()
-        .any(|area| area.bar_idx == msix_cap.table_bir())
-    {
+    let (areas, emulated_areas) = vfio_calculate_bar_areas_optional(
+        &bars.vmm_bars,
+        &bar_infos,
+        msix_state.as_ref().map(|state| &state.cap),
+    )?;
+    if msix_state.as_ref().is_some_and(|state| {
+        !emulated_areas
+            .iter()
+            .any(|area| area.bar_idx == state.cap.table_bir())
+    }) {
         return Err(VfioError::NoMsixIrq);
     }
 
@@ -1445,12 +1497,6 @@ fn vfio_finish_device(
     let bar_mappings =
         vfio_create_bar_mappings_from_areas(vm.as_ref(), &areas, &device, first_area_slot)?;
 
-    let msix_state = VfioMsixState {
-        register: msix_register,
-        cap: msix_cap,
-        config: msix_config,
-    };
-
     let vfio_device = VfioDevice {
         config,
         sbdf,
@@ -1459,6 +1505,7 @@ fn vfio_finish_device(
         bar_mappings,
         emulated_areas,
         msix_state,
+        msi_state,
         masks,
         vm: vm.clone(),
     };
@@ -2037,6 +2084,18 @@ mod tests {
         let first_bar_addr2 = bars2.get_bar_addr_64(0);
         assert_eq!(first_bar_addr, first_bar_addr2);
         assert!(bars2.bars[0].used());
+    }
+
+    #[test]
+    fn test_vfio_msi_bar_has_no_msix_table_gap() {
+        let mut bars = Bars::default();
+        bars.set_bar_32(0, 0x10000000, 0x10000, false.into());
+        let infos = dummy_bar_infos([dummy_mmappable_bar_info(0, 0x10000)]);
+        let (areas, emulated) = vfio_calculate_bar_areas_optional(&bars, &infos, None).unwrap();
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].gpa, 0x10000000);
+        assert_eq!(areas[0].size, 0x10000);
+        assert_eq!(emulated.len(), 1);
     }
 
     #[test]

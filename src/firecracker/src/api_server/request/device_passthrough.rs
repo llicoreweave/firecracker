@@ -78,6 +78,7 @@ mod tests {
             id: "dev0".to_string(),
             sbdf: PciSBDF::new(0x0, 0x0, 0x1f, 0x0),
             pci_address: None,
+            peer_dma: false,
         };
         assert_eq!(r, VmmAction::InsertPassthroughDevice(expected_config));
     }

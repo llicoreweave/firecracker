@@ -272,6 +272,7 @@ mod tests {
         let devices = vec![DevicePassthroughConfig {
             id: "gpu".into(),
             sbdf: PciSBDF::new_from_str("0000:a0:00.0").unwrap(),
+            peer_dma: false,
             pci_address: Some(PciAddress {
                 bus: 9,
                 device: 3,

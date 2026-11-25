@@ -43,6 +43,9 @@ pub struct DevicePassthroughConfig {
     /// Explicit guest endpoint address when using a static PCI topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pci_address: Option<crate::vmm_config::pci_topology::PciAddress>,
+    /// Export large prefetchable BARs into the static graph's IOMMUFD address space.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub peer_dma: bool,
 }
 
 /// Configs for device passthrough
@@ -91,6 +94,7 @@ mod tests {
                 id: "dev0".to_string(),
                 sbdf: id1,
                 pci_address: None,
+                peer_dma: false,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 1);
@@ -101,6 +105,7 @@ mod tests {
                 id: "dev0".to_string(),
                 sbdf: id2,
                 pci_address: None,
+                peer_dma: false,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 1);
@@ -111,6 +116,7 @@ mod tests {
                 id: "dev1".to_string(),
                 sbdf: id1,
                 pci_address: None,
+                peer_dma: false,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 2);
@@ -122,6 +128,7 @@ mod tests {
                 id: "dev1".to_string(),
                 sbdf: id2,
                 pci_address: None,
+                peer_dma: false,
             })
             .unwrap_err();
         assert_eq!(configs.configs.len(), 2);

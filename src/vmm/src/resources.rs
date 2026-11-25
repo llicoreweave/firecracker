@@ -352,9 +352,9 @@ impl VmResources {
             .device_passthrough
             .configs
             .iter()
-            .any(|c| c.pci_address.is_some())
+            .any(|c| c.pci_address.is_some() || c.peer_dma)
         {
-            return Err("explicit endpoint addresses require pci-topology".into());
+            return Err("explicit endpoint addresses and peer DMA require pci-topology".into());
         }
         Ok(())
     }
@@ -829,6 +829,44 @@ impl From<&VmResources> for VmmConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_peer_dma_requires_static_graph() {
+        use crate::vmm_config::device_passthrough::DevicePassthroughConfig;
+        use crate::vmm_config::pci_topology::{PciAddress, PciRootConfig, PciTopologyConfig};
+        let mut resources = VmResources {
+            pci_enabled: true,
+            balloon: crate::vmm_config::balloon::BalloonBuilder::new(),
+            ..Default::default()
+        };
+        resources
+            .device_passthrough
+            .add(DevicePassthroughConfig {
+                id: "gpu".into(),
+                sbdf: crate::pci::PciSBDF::new(0, 0xa0, 0, 0),
+                peer_dma: true,
+                pci_address: None,
+            })
+            .unwrap();
+        resources.validate().unwrap_err();
+        resources.pci_topology = Some(PciTopologyConfig {
+            roots: vec![PciRootConfig {
+                bus: 0,
+                last_bus: 0,
+                numa_node: None,
+            }],
+            bridges: vec![],
+        });
+        resources.validate().unwrap_err();
+        resources.device_passthrough.configs[0].pci_address = Some(PciAddress {
+            bus: 0,
+            device: 16,
+            function: 0,
+        });
+        resources.validate().unwrap();
+        resources.machine_config.pcie_hotplug_ports = 1;
+        resources.validate().unwrap_err();
+    }
+
     #[test]
     fn test_pci_mmio64_requires_pci() {
         use crate::vmm_config::pci_mmio::PciMmio64Config;

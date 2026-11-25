@@ -137,7 +137,8 @@
         "bus": 3,
         "device": 0,
         "function": 0
-      }
+      },
+      "peer_dma": true
     },
     {
       "id": "0000:a1:00.0",
@@ -155,7 +156,8 @@
         "bus": 8,
         "device": 0,
         "function": 0
-      }
+      },
+      "peer_dma": true
     }
   ]
 }

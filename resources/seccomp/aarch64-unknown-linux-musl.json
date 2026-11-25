@@ -1180,6 +1180,66 @@
                         "comment": "VFIO_IOMMU_MAP_DMA"
                     }
                 ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15221,
+                        "comment": "VFIO_DEVICE_FEATURE DMA-BUF export"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15247,
+                        "comment": "IOMMU_IOAS_MAP_FILE peer BAR import"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15238,
+                        "comment": "IOMMU_IOAS_UNMAP"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15232,
+                        "comment": "IOMMU_DESTROY"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15224,
+                        "comment": "VFIO_DEVICE_DETACH_IOMMUFD_PT"
+                    }
+                ]
             }
         ]
     },
@@ -1868,6 +1928,66 @@
             {
                 "syscall": "ppoll",
                 "comment": "Read pending MSI eventfds without consuming events"
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15221,
+                        "comment": "VFIO_DEVICE_FEATURE DMA-BUF export"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15247,
+                        "comment": "IOMMU_IOAS_MAP_FILE peer BAR import"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15238,
+                        "comment": "IOMMU_IOAS_UNMAP"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15232,
+                        "comment": "IOMMU_DESTROY"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 15224,
+                        "comment": "VFIO_DEVICE_DETACH_IOMMUFD_PT"
+                    }
+                ]
             }
         ]
     },

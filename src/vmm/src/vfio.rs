@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod msi;
+pub(crate) mod peer_dma;
 
 use std::ops::DerefMut;
 use std::os::fd::AsRawFd;
@@ -59,6 +60,10 @@ const PCI_CONFIG_BAR_PREFETCHABLE: u32 = 1 << 3;
 pub enum VfioError {
     /// Failed to allocate guest address for BAR
     BarAllocation,
+    /// IOMMUFD error: {0}
+    Iommufd(#[from] iommufd_ioctls::IommufdError),
+    /// Peer BAR mapping error: {0}
+    PeerDma(#[from] std::io::Error),
     /// Mmap failed: {0:?}
     Mmap(std::io::Error),
     /// Failed to allocate KVM slot
@@ -109,17 +114,28 @@ pub(crate) struct PreparedVfioDevice {
     config: DevicePassthroughConfig,
     device: InternalVfioDevice,
     bar_infos: [VfioBarInfo; NUM_BAR_REGS as usize],
+    peer_context: Option<Arc<peer_dma::PeerContext>>,
 }
 impl PreparedVfioDevice {
     pub(crate) fn new(
         container: &Arc<VfioContainer>,
         config: DevicePassthroughConfig,
     ) -> Result<Self, VfioError> {
+        Self::with_ops(container.clone(), config, None)
+    }
+    pub(crate) fn with_peer(
+        context: Arc<peer_dma::PeerContext>,
+        config: DevicePassthroughConfig,
+    ) -> Result<Self, VfioError> {
+        Self::with_ops(context.ops.clone(), config, Some(context))
+    }
+    fn with_ops(
+        ops: Arc<dyn vfio_ioctls::VfioOps>,
+        config: DevicePassthroughConfig,
+        peer_context: Option<Arc<peer_dma::PeerContext>>,
+    ) -> Result<Self, VfioError> {
         let sysfs_path = format!("/sys/bus/pci/devices/{}", config.sbdf);
-        let device = InternalVfioDevice::new(
-            Path::new(&sysfs_path),
-            container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
-        )?;
+        let device = InternalVfioDevice::new(Path::new(&sysfs_path), ops)?;
         vfio_device_reset_command_reg(&device);
         device.reset();
         let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
@@ -135,6 +151,7 @@ impl PreparedVfioDevice {
             config,
             device,
             bar_infos,
+            peer_context,
         })
     }
     pub(crate) fn requirements(&self) -> Vec<BarRequirement> {
@@ -284,6 +301,8 @@ pub struct VfioDevice {
     msi_state: Option<msi::MsiState>,
     masks: Vec<VfioRegisterMask>,
     vm: Arc<KvmVm>,
+    peer_context: Option<Arc<peer_dma::PeerContext>>,
+    peer_mappings: Vec<peer_dma::PeerDmaMapping>,
 }
 
 impl std::fmt::Debug for VfioDevice {
@@ -330,7 +349,61 @@ impl VfioDevice {
     }
 
     fn maybe_relocate_all_bars(&mut self) {
-        vfio_maybe_relocate_all_bars(self);
+        if self.config.peer_dma {
+            self.bars.guest_bars = self.bars.vmm_bars;
+        } else {
+            vfio_maybe_relocate_all_bars(self);
+        }
+    }
+
+    fn refresh_peer_mappings(&mut self) -> Result<(), VfioError> {
+        if !self.config.peer_dma || !self.peer_mappings.is_empty() {
+            return Ok(());
+        }
+        let context = self
+            .peer_context
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("peer DMA requires a static IOMMUFD context"))?;
+        let mut imports = Vec::new();
+        for index in 0..NUM_BAR_REGS {
+            if self.bars.vmm_bars.bar_idx_valid(index) {
+                let bar = self.bars.vmm_bars.bars[usize::from(index)];
+                let size = self.bars.vmm_bars.get_bar_size(index);
+                if bar.is_64bit() && bar.is_prefetchable() && size >= 1 << 30 {
+                    imports.push(peer_dma::PeerDmaMapping::new(
+                        context,
+                        self.device.as_raw_fd(),
+                        u32::from(index),
+                        0,
+                        size,
+                        self.bars.vmm_bars.get_bar_addr(index),
+                    )?);
+                }
+            }
+        }
+        self.peer_mappings = imports;
+        Ok(())
+    }
+
+    pub(crate) fn stop_dma(&self) {
+        let mut command = [0u8; 2];
+        self.device.region_read(
+            VFIO_PCI_CONFIG_REGION_INDEX,
+            &mut command,
+            u64::from(COMMAND_REG) * 4,
+        );
+        let command = (u16::from_le_bytes(command)
+            & !u16::try_from(COMMAND_BUS_MASTER_ENABLE).unwrap())
+        .to_le_bytes();
+        self.device.region_write(
+            VFIO_PCI_CONFIG_REGION_INDEX,
+            &command,
+            u64::from(COMMAND_REG) * 4,
+        );
+    }
+
+    pub(crate) fn clear_peer_mappings(&mut self) {
+        self.peer_mappings.clear();
     }
 }
 
@@ -534,13 +607,17 @@ impl PciDevice for VfioDevice {
                 } else {
                     bar_idx - 1
                 };
-                vfio_maybe_relocate_bar(
-                    &mut self.bars,
-                    bar_idx,
-                    &mut self.emulated_areas,
-                    &mut self.bar_mappings,
-                    &self.vm,
-                );
+                if self.config.peer_dma {
+                    self.bars.guest_bars = self.bars.vmm_bars;
+                } else {
+                    vfio_maybe_relocate_bar(
+                        &mut self.bars,
+                        bar_idx,
+                        &mut self.emulated_areas,
+                        &mut self.bar_mappings,
+                        &self.vm,
+                    );
+                }
             }
 
             // write is passed through to the kernel in case it needs to know
@@ -577,8 +654,18 @@ impl PciDevice for VfioDevice {
             self.device
                 .region_write(VFIO_PCI_CONFIG_REGION_INDEX, data, config_offset);
 
-            if !mem_enabled_before && vfio_device_memory_space_enabled(&self.device) {
+            let enabled = vfio_device_memory_space_enabled(&self.device);
+            if !mem_enabled_before && enabled {
                 self.maybe_relocate_all_bars();
+                if let Err(error) = self.refresh_peer_mappings() {
+                    error!("Peer BAR mapping failed; stopping the VM: {error}");
+                    self.stop_dma();
+                    if let Err(error) = self.vm.vcpus_exit_evt().write(1) {
+                        error!("Could not signal VM shutdown: {error}");
+                    }
+                }
+            } else if mem_enabled_before && !enabled {
+                self.clear_peer_mappings();
             }
         } else {
             // If we mask some registers, there is no reason to allow writing to them
@@ -1432,6 +1519,7 @@ fn vfio_finish_device(
         config,
         device,
         bar_infos,
+        peer_context,
     } = prepared;
     let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
     device.region_read(VFIO_PCI_CONFIG_REGION_INDEX, config_space.as_mut_bytes(), 0);
@@ -1497,7 +1585,7 @@ fn vfio_finish_device(
     let bar_mappings =
         vfio_create_bar_mappings_from_areas(vm.as_ref(), &areas, &device, first_area_slot)?;
 
-    let vfio_device = VfioDevice {
+    let mut vfio_device = VfioDevice {
         config,
         sbdf,
         device,
@@ -1508,8 +1596,11 @@ fn vfio_finish_device(
         msi_state,
         masks,
         vm: vm.clone(),
+        peer_context,
+        peer_mappings: Vec::new(),
     };
-
+    // Fail boot if requested BAR export/import is unavailable.
+    vfio_device.refresh_peer_mappings()?;
     Ok(vfio_device)
 }
 
@@ -1527,6 +1618,13 @@ fn vfio_deinit_device(device: &VfioDevice) {
 /// mappings when the last group is detached, including on errors.
 pub fn vfio_dma_map_guest_memory(
     container: &VfioContainer,
+    guest_memory: &GuestMemoryMmap,
+) -> Result<(), VfioError> {
+    vfio_dma_map_guest_memory_with_ops(container, guest_memory)
+}
+
+fn vfio_dma_map_guest_memory_with_ops(
+    container: &dyn vfio_ioctls::VfioOps,
     guest_memory: &GuestMemoryMmap,
 ) -> Result<(), VfioError> {
     for region in guest_memory.iter() {
@@ -1552,19 +1650,21 @@ pub fn vfio_dma_map_guest_memory(
 pub fn vfio_create_kvm_vfio_device_and_vfio_container(
     vm: &KvmVm,
 ) -> Result<Arc<VfioContainer>, VfioError> {
+    let container = VfioContainer::new(Some(Arc::new(vfio_create_kvm_device(vm)?)))?;
+    Ok(Arc::new(container))
+}
+
+fn vfio_create_kvm_device(vm: &KvmVm) -> Result<VfioDeviceFd, VfioError> {
     let mut vfio_dev = kvm_create_device {
         type_: kvm_device_type_KVM_DEV_TYPE_VFIO,
         fd: 0,
         flags: 0,
     };
-    let kvm_device_fd = vm
+    let fd = vm
         .fd()
         .create_device(&mut vfio_dev)
         .map_err(VfioError::KvmCreateVfioDevice)?;
-
-    let device_fd = VfioDeviceFd::new_from_kvm(kvm_device_fd);
-    let container = VfioContainer::new(Some(Arc::new(device_fd)))?;
-    Ok(Arc::new(container))
+    Ok(VfioDeviceFd::new_from_kvm(fd))
 }
 
 #[cfg(test)]

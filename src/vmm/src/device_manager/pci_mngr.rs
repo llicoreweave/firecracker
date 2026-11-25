@@ -80,6 +80,32 @@ pub struct PciDevices {
     numa: Option<Box<crate::numa::NumaConfig>>,
 }
 
+impl Drop for PciDevices {
+    fn drop(&mut self) {
+        if !self.vfio_devices.iter().any(|d| {
+            d.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .config
+                .peer_dma
+        }) {
+            return;
+        }
+        // Stop every DMA initiator before removing any shared peer BAR mapping.
+        for device in &self.vfio_devices {
+            device
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stop_dma();
+        }
+        for device in &self.vfio_devices {
+            device
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear_peer_mappings();
+        }
+    }
+}
+
 impl std::fmt::Debug for PciDevices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PciDevices")
@@ -449,12 +475,29 @@ impl PciDevices {
                 "static devices must be attached together".into(),
             ));
         }
-        let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
+        let peer_context = if configs.iter().any(|c| c.peer_dma) {
+            Some(crate::vfio::peer_dma::PeerContext::new(vm)?)
+        } else {
+            None
+        };
+        let container = if peer_context.is_none() {
+            Some(vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?)
+        } else {
+            None
+        };
         let mut prepared = Vec::new();
         for config in configs {
-            prepared.push(PreparedVfioDevice::new(&container, config.clone())?);
+            prepared.push(if let Some(context) = &peer_context {
+                PreparedVfioDevice::with_peer(context.clone(), config.clone())?
+            } else {
+                PreparedVfioDevice::new(container.as_ref().unwrap(), config.clone())?
+            });
         }
-        vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
+        if let Some(context) = &peer_context {
+            context.map_guest_memory(vm.guest_memory())?;
+        } else {
+            vfio_dma_map_guest_memory(container.as_ref().unwrap(), vm.guest_memory())?;
+        }
         let paths: Vec<_> = configs.iter().map(|c| plan.paths[&c.id].clone()).collect();
         let requirements: Vec<_> = prepared
             .iter()
@@ -484,7 +527,7 @@ impl PciDevices {
             })
             .collect();
         plan.install(&self.pci_segment.pci_buses, &ranges)?;
-        self.vfio_container = Some(container);
+        self.vfio_container = container;
         for (index, device) in prepared.into_iter().enumerate() {
             let sbdf = plan.address(&paths[index]);
             let layout: Vec<_> = placements
@@ -518,7 +561,7 @@ impl PciDevices {
         vm: &Arc<KvmVm>,
         config: DevicePassthroughConfig,
     ) -> Result<(), PciManagerError> {
-        if self.topology.is_some() || config.pci_address.is_some() {
+        if self.topology.is_some() || config.pci_address.is_some() || config.peer_dma {
             return Err(PciManagerError::Topology(
                 "static PCI topology does not support hotplug".into(),
             ));

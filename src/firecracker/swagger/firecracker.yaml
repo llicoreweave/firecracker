@@ -1680,6 +1680,10 @@ definitions:
           Host PCI device identifier. Accepted formats - full SBDF ("0000:01:02.3") or
           short BDF ("01:02.3").
 
+      peer_dma:
+        type: boolean
+        default: false
+        description: Export large prefetchable BARs into the static graph's IOMMUFD address space. Requires pci-topology, VFIO cdevs and host DMA-BUF support.
       pci_address:
         $ref: "#/definitions/PciAddress"
 

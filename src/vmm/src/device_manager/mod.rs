@@ -1434,6 +1434,7 @@ pub(crate) mod tests {
             id: "dev0".to_string(),
             sbdf: PciSBDF::new(0, 1, 0, 0),
             pci_address: None,
+            peer_dma: false,
         };
 
         let mut vmm = default_vmm();

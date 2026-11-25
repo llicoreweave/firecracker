@@ -40,6 +40,9 @@ pub struct DevicePassthroughConfig {
         deserialize_with = "deserialize_sbdf_from_str"
     )]
     pub sbdf: PciSBDF,
+    /// Explicit guest endpoint address when using a static PCI topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pci_address: Option<crate::vmm_config::pci_topology::PciAddress>,
 }
 
 /// Configs for device passthrough
@@ -64,7 +67,7 @@ impl DevicePassthroughConfigs {
             return Err(DevicePassthroughConfigError::DuplicateSBDF(config.sbdf));
         }
         if let Some(old_config) = self.configs.iter_mut().find(|b| b.id == config.id) {
-            old_config.sbdf = config.sbdf;
+            *old_config = config;
         } else {
             self.configs.push(config);
         }
@@ -87,6 +90,7 @@ mod tests {
             .add(DevicePassthroughConfig {
                 id: "dev0".to_string(),
                 sbdf: id1,
+                pci_address: None,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 1);
@@ -96,6 +100,7 @@ mod tests {
             .add(DevicePassthroughConfig {
                 id: "dev0".to_string(),
                 sbdf: id2,
+                pci_address: None,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 1);
@@ -105,6 +110,7 @@ mod tests {
             .add(DevicePassthroughConfig {
                 id: "dev1".to_string(),
                 sbdf: id1,
+                pci_address: None,
             })
             .unwrap();
         assert_eq!(configs.configs.len(), 2);
@@ -115,6 +121,7 @@ mod tests {
             .add(DevicePassthroughConfig {
                 id: "dev1".to_string(),
                 sbdf: id2,
+                pci_address: None,
             })
             .unwrap_err();
         assert_eq!(configs.configs.len(), 2);

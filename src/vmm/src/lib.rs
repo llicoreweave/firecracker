@@ -441,6 +441,10 @@ impl Vmm {
         VmmConfig {
             balloon,
             numa: self.vm.as_kvm().and_then(|vm| vm.common.numa.clone()),
+            pci_topology: self
+                .device_manager
+                .pci_devices()
+                .and_then(|pci| pci.topology.as_ref().map(|t| t.config.clone())),
             drives: block,
             boot_source: self.boot_source_config.clone(),
             cpu_config: None,

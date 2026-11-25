@@ -366,11 +366,19 @@ pub fn build_microvm_for_boot(
         )?;
     }
 
-    attach_vfio_devices(
-        &mut device_manager,
-        &vm,
-        &vm_resources.device_passthrough.configs,
-    )?;
+    if let Some(topology) = &vm_resources.pci_topology {
+        device_manager.attach_static_topology(
+            &kvm_vm,
+            topology,
+            &vm_resources.device_passthrough.configs,
+        )?;
+    } else {
+        attach_vfio_devices(
+            &mut device_manager,
+            &vm,
+            &vm_resources.device_passthrough.configs,
+        )?;
+    }
 
     #[cfg(target_arch = "aarch64")]
     device_manager.attach_legacy_devices_aarch64(

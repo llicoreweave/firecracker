@@ -12,7 +12,11 @@ use super::persist::{DeviceStates, MmdsState, VirtioDeviceState};
 use crate::EventManager;
 use crate::device_manager::DevicePersistError;
 use crate::devices::pci::PciSegment;
+#[cfg(target_arch = "x86_64")]
+use crate::devices::pci::bar_placement::pci_root_windows;
+use crate::devices::pci::bar_placement::place_grouped_vfio_bars;
 use crate::devices::pci::root_port::{PciRootPortRestoreError, PciRootPortState};
+use crate::devices::pci::static_topology::StaticTopology;
 use crate::devices::virtio::balloon::Balloon;
 use crate::devices::virtio::balloon::persist::BalloonConstructorArgs;
 use crate::devices::virtio::block::device::Block;
@@ -38,6 +42,7 @@ use crate::pci::bus::PciBusError;
 use crate::resources::VmResources;
 use crate::seccomp::BpfProgram;
 use crate::snapshot::Persist;
+use crate::vfio::{BarWindow, PreparedVfioDevice};
 use crate::vfio::{
     VfioContainer, VfioDevice, VfioError, vfio_create_kvm_vfio_device_and_vfio_container,
     vfio_dma_map_guest_memory,
@@ -70,6 +75,9 @@ pub struct PciDevices {
     // Rust drops items in declaration order, so make sure the `container` is dropped after all vfio
     // devices
     vfio_container: Option<Arc<VfioContainer>>,
+    pub(crate) topology: Option<Box<StaticTopology>>,
+    topology_ranges: Vec<(Vec<u8>, u64, u64, bool)>,
+    numa: Option<Box<crate::numa::NumaConfig>>,
 }
 
 impl std::fmt::Debug for PciDevices {
@@ -84,6 +92,8 @@ impl std::fmt::Debug for PciDevices {
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum PciManagerError {
+    /// Invalid explicit PCI topology: {0}
+    Topology(String),
     /// Resource allocation error: {0}
     ResourceAllocation(#[from] vm_allocator::Error),
     /// Device {0} sets dmb_size_mib, which this transport does not support
@@ -135,6 +145,9 @@ impl PciDevices {
             virtio_devices: HashMap::new(),
             vfio_devices: Vec::new(),
             vfio_container: None,
+            topology: None,
+            topology_ranges: Vec::new(),
+            numa: vm.common.numa.clone().map(Box::new),
         })
     }
 
@@ -248,6 +261,9 @@ impl PciDevices {
 
     /// Attach the configured number of PCIe root ports.
     pub(crate) fn attach_root_ports(&mut self, vm: &Arc<KvmVm>) -> Result<(), PciManagerError> {
+        if self.topology.is_some() {
+            return Ok(());
+        }
         self.pci_segment.attach_root_ports(vm)
     }
 
@@ -258,7 +274,36 @@ impl PciDevices {
     ) -> Result<(), acpi_tables::aml::AmlError> {
         use acpi_tables::Aml;
 
-        self.pci_segment().append_aml_bytes(dsdt_data)
+        if let Some(plan) = &self.topology {
+            let segment = &self.pci_segment;
+            for root in &plan.config.roots {
+                let mem32 = pci_root_windows(
+                    plan,
+                    &self.topology_ranges,
+                    root.bus,
+                    false,
+                    (segment.start_of_mem32_area, segment.end_of_mem32_area),
+                );
+                let mem64 = pci_root_windows(
+                    plan,
+                    &self.topology_ranges,
+                    root.bus,
+                    true,
+                    (segment.start_of_mem64_area, segment.end_of_mem64_area),
+                );
+                PciSegment::append_configured_root(
+                    dsdt_data,
+                    segment.mmio_config_address,
+                    root,
+                    &mem32,
+                    &mem64,
+                    &segment.pci_irq_slots,
+                )?;
+            }
+            Ok(())
+        } else {
+            self.pci_segment().append_aml_bytes(dsdt_data)
+        }
     }
 
     pub(crate) fn detach_pci_virtio_device(
@@ -347,12 +392,137 @@ impl PciDevices {
         }
     }
 
+    /// Validate every configured root, bridge and endpoint before opening host devices.
+    pub(crate) fn configure_static_topology(
+        &mut self,
+        topology: &crate::vmm_config::pci_topology::PciTopologyConfig,
+        configs: &[DevicePassthroughConfig],
+    ) -> Result<(), PciManagerError> {
+        if !self.pci_segment.root_ports.is_empty() {
+            return Err(PciManagerError::Topology(
+                "static graph cannot use hotplug ports".into(),
+            ));
+        }
+        let plan = StaticTopology::new(
+            topology,
+            configs,
+            self.numa.as_ref().map_or(0, |n| n.nodes.len()),
+        )
+        .map_err(PciManagerError::Topology)?;
+        for address in topology
+            .bridges
+            .iter()
+            .map(|b| b.pci_address)
+            .chain(configs.iter().filter_map(|c| c.pci_address))
+        {
+            if self
+                .pci_segment
+                .pci_buses
+                .get(address.bus)
+                .is_some_and(|bus| bus.lock().unwrap().get_device(address.device).is_some())
+            {
+                return Err(PciManagerError::Topology(
+                    "configured PCI address is already occupied".into(),
+                ));
+            }
+        }
+        self.topology = Some(Box::new(plan));
+        Ok(())
+    }
+
+    /// Open upstream VFIO devices, allocate BARs within the supplied graph, and install it.
+    pub(crate) fn attach_static_vfio_devices(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        configs: &[DevicePassthroughConfig],
+    ) -> Result<(), PciManagerError> {
+        let plan = self
+            .topology
+            .as_deref()
+            .ok_or_else(|| PciManagerError::Topology("missing PCI graph".into()))?;
+        if configs.is_empty() {
+            plan.install(&self.pci_segment.pci_buses, &[])?;
+            return Ok(());
+        }
+        if !self.vfio_devices.is_empty() {
+            return Err(PciManagerError::Topology(
+                "static devices must be attached together".into(),
+            ));
+        }
+        let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
+        let mut prepared = Vec::new();
+        for config in configs {
+            prepared.push(PreparedVfioDevice::new(&container, config.clone())?);
+        }
+        vfio_dma_map_guest_memory(&container, vm.guest_memory())?;
+        let paths: Vec<_> = configs.iter().map(|c| plan.paths[&c.id].clone()).collect();
+        let requirements: Vec<_> = prepared
+            .iter()
+            .enumerate()
+            .flat_map(|(i, d)| d.requirements().into_iter().map(move |r| (i, r)))
+            .collect();
+        let placements = place_grouped_vfio_bars(
+            &mut vm.resource_allocator(),
+            requirements.clone(),
+            &paths,
+            Some(plan),
+        )?;
+        let ranges: Vec<_> = placements
+            .iter()
+            .map(|&(i, slot, addr)| {
+                let r = requirements
+                    .iter()
+                    .find(|(idx, r)| *idx == i && r.slot == slot)
+                    .unwrap()
+                    .1;
+                (
+                    paths[i].clone(),
+                    addr,
+                    r.size,
+                    r.window == BarWindow::Mmio64,
+                )
+            })
+            .collect();
+        plan.install(&self.pci_segment.pci_buses, &ranges)?;
+        self.vfio_container = Some(container);
+        for (index, device) in prepared.into_iter().enumerate() {
+            let sbdf = plan.address(&paths[index]);
+            let layout: Vec<_> = placements
+                .iter()
+                .filter_map(|&(i, slot, addr)| (i == index).then_some((slot, addr)))
+                .collect();
+            let device = device.finish(vm, sbdf, &layout)?;
+            let areas = device.emulated_areas.clone();
+            let device = Arc::new(Mutex::new(device));
+            self.pci_segment
+                .pci_buses
+                .get(sbdf.bus())
+                .ok_or_else(|| PciBusError::InvalidBusNumber(sbdf.bus()))?
+                .lock()
+                .unwrap()
+                .add_device(sbdf.device(), device.clone())?;
+            for area in areas {
+                vm.common
+                    .mmio_bus
+                    .insert(device.clone(), area.gpa, area.size)?;
+            }
+            self.vfio_devices.push(device);
+        }
+        self.topology_ranges = ranges;
+        Ok(())
+    }
+
     /// Attach VFIO device and notify the guest about it
     pub fn hotplug_vfio_device(
         &mut self,
         vm: &Arc<KvmVm>,
         config: DevicePassthroughConfig,
     ) -> Result<(), PciManagerError> {
+        if self.topology.is_some() || config.pci_address.is_some() {
+            return Err(PciManagerError::Topology(
+                "static PCI topology does not support hotplug".into(),
+            ));
+        }
         let sbdf = self.attach_vfio_device(vm, config, PciPlacement::SecondaryBus)?;
 
         // Notify the guest the device is hot-plugged
@@ -431,7 +601,7 @@ impl PciDevices {
             let device = device.lock().expect("Poisoned lock");
             if device.config.id == id {
                 let bus = device.sbdf.bus();
-                if bus == 0 {
+                if bus == 0 || self.topology.is_some() {
                     return Err(PciManagerError::DeviceNotRemovable(id));
                 }
                 return Ok((idx, bus));
@@ -1017,6 +1187,61 @@ mod tests {
     use crate::vmm_config::pmem::PmemConfig;
     use crate::vmm_config::vsock::VsockDeviceConfig;
     use crate::vstate::resources::ResourceAllocator;
+
+    #[test]
+    fn test_static_pci_graph_does_not_add_hotplug_ports() {
+        use crate::vmm_config::pci_topology::{
+            PciAddress, PciBridgeConfig, PciBridgeKind, PciRootConfig, PciTopologyConfig,
+        };
+
+        for (base, size) in [
+            (crate::arch::MMIO64_MEM_START, crate::arch::MMIO64_MEM_SIZE),
+            (16 << 30, 8 << 30),
+            (2 << 40, 2 << 40),
+        ] {
+            let vmm = default_vmm();
+            let vm = vmm.vm.as_kvm().unwrap().clone();
+            *vm.resource_allocator() = ResourceAllocator::with_mmio64_range(base, size).unwrap();
+            let mut pci = PciDevices::new(&vm, 0).unwrap();
+            let topology = PciTopologyConfig {
+                roots: vec![
+                    PciRootConfig {
+                        bus: 0,
+                        last_bus: 2,
+                        numa_node: None,
+                    },
+                    PciRootConfig {
+                        bus: 25,
+                        last_bus: 25,
+                        numa_node: None,
+                    },
+                ],
+                bridges: vec![PciBridgeConfig {
+                    pci_address: PciAddress {
+                        bus: 0,
+                        device: 13,
+                        function: 0,
+                    },
+                    secondary_bus: 2,
+                    subordinate_bus: 2,
+                    kind: PciBridgeKind::RootPort,
+                }],
+            };
+            pci.configure_static_topology(&topology, &[]).unwrap();
+            pci.attach_static_vfio_devices(&vm, &[]).unwrap();
+            pci.attach_root_ports(&vm).unwrap();
+
+            assert!(pci.pci_segment.root_ports.is_empty());
+            assert_eq!(pci.pci_segment.next_device_sbdf().unwrap().device(), 1);
+            let root = pci.pci_segment.pci_buses.root_bus().lock().unwrap();
+            let mut bridge = root.get_device(13).unwrap().lock().unwrap();
+            assert_eq!(bridge.read_config_register(6), 0x0002_0200);
+            assert!(pci.pci_segment.pci_buses.get(25).is_some());
+            assert!(pci.pci_segment.pci_buses.get(1).is_none());
+            assert_eq!(pci.pci_segment.start_of_mem64_area, base);
+            assert_eq!(pci.pci_segment.end_of_mem64_area, base + size - 1);
+        }
+    }
 
     #[test]
     fn test_device_manager_persistence() {

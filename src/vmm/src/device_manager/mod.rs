@@ -319,6 +319,21 @@ impl DeviceManager {
         }
     }
 
+    /// Install caller-supplied static topology using the upstream VFIO backend.
+    pub(crate) fn attach_static_topology(
+        &mut self,
+        vm: &Arc<KvmVm>,
+        topology: &crate::vmm_config::pci_topology::PciTopologyConfig,
+        configs: &[DevicePassthroughConfig],
+    ) -> Result<(), AttachDeviceError> {
+        let VirtioDevices::Pci(pci) = &mut self.virtio_devices else {
+            return Err(AttachDeviceError::NotSupported);
+        };
+        pci.configure_static_topology(topology, configs)?;
+        pci.attach_static_vfio_devices(vm, configs)?;
+        Ok(())
+    }
+
     /// Attaches a [`BootTimer`] to the VM
     pub(crate) fn attach_boot_timer_device(
         &mut self,
@@ -1418,6 +1433,7 @@ pub(crate) mod tests {
         let cfg = DevicePassthroughConfig {
             id: "dev0".to_string(),
             sbdf: PciSBDF::new(0, 1, 0, 0),
+            pci_address: None,
         };
 
         let mut vmm = default_vmm();

@@ -35,6 +35,7 @@ pub mod mmds;
 pub mod net;
 /// PCI MMIO64 configuration.
 pub mod pci_mmio;
+pub mod pci_topology;
 /// Wrapper for configuring the pmem devises attached to the microVM.
 pub mod pmem;
 /// Wrapper for configuring microVM snapshots and the microVM state.

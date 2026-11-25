@@ -10,6 +10,9 @@ and this project adheres to
 
 ### Added
 
+- Caller-configured PCI roots, bridges, bus numbers and endpoint addresses with
+  NUMA root affinity. See [NUMA and PCI topology](docs/pci-numa.md).
+
 - Added `pci_mmio64.base_gib` and `pci_mmio64.size_gib` machine settings for the
   preboot PCI MMIO64 aperture on x86_64 and aarch64. See
   [PCI MMIO64 configuration](docs/pci-mmio64.md).

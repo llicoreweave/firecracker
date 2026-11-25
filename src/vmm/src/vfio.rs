@@ -42,8 +42,6 @@ use crate::vstate::vm::{KvmVm, VmError};
 
 // Number of 4 byte registers in the config space
 const PCI_CONFIG_SPACE_REGS: u16 = 1024;
-// First BAR offset in the PCI config space.
-const PCI_CONFIG_BAR_OFFSET: u32 = 0x10;
 // Capability register offset in the PCI config space.
 const PCI_CONFIG_CAPABILITY_OFFSET: u32 = 0x34;
 // Extended capabilities register offset in the PCI config space.
@@ -82,6 +80,107 @@ pub enum VfioError {
     SparseMmapAreaOutOfRange(u8, u64, u64, u64),
     /// BAR{0} sparse mmap area at gpa {1:#x} size {2:#x} overlaps MSI-X at gpa {3:#x} size {4:#x}
     SparseMmapAreaOverlapsMsixTable(u8, u64, u64, u64, u64),
+}
+
+/// BAR slot in an explicitly configured endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum BarSlot {
+    Bar(u8),
+}
+/// Allocator window selected by the BAR's PCI flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarWindow {
+    Mmio32,
+    Mmio64,
+}
+/// Hardware requirement used by static graph resource allocation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BarRequirement {
+    pub slot: BarSlot,
+    pub size: u64,
+    pub window: BarWindow,
+}
+
+/// An opened upstream VFIO device whose guest BAR addresses have not been assigned.
+pub(crate) struct PreparedVfioDevice {
+    config: DevicePassthroughConfig,
+    device: InternalVfioDevice,
+    bar_infos: [VfioBarInfo; NUM_BAR_REGS as usize],
+}
+impl PreparedVfioDevice {
+    pub(crate) fn new(
+        container: &Arc<VfioContainer>,
+        config: DevicePassthroughConfig,
+    ) -> Result<Self, VfioError> {
+        let sysfs_path = format!("/sys/bus/pci/devices/{}", config.sbdf);
+        let device = InternalVfioDevice::new(
+            Path::new(&sysfs_path),
+            container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
+        )?;
+        vfio_device_reset_command_reg(&device);
+        device.reset();
+        let mut config_space = [0_u32; PCI_CONFIG_SPACE_REGS as usize];
+        device.region_read(VFIO_PCI_CONFIG_REGION_INDEX, config_space.as_mut_bytes(), 0);
+        let bar_infos = std::array::from_fn(|i| VfioBarInfo {
+            bar_value: config_space[usize::from(BAR0_REG_IDX) + i],
+            flags: device.get_region_flags(u32::try_from(i).unwrap()),
+            size: device.get_region_size(u32::try_from(i).unwrap()),
+            offset: device.get_region_offset(u32::try_from(i).unwrap()),
+            caps: device.get_region_caps(u32::try_from(i).unwrap()),
+        });
+        Ok(Self {
+            config,
+            device,
+            bar_infos,
+        })
+    }
+    pub(crate) fn requirements(&self) -> Vec<BarRequirement> {
+        let mut requirements = Vec::new();
+        let mut index = 0u8;
+        while index < NUM_BAR_REGS {
+            let info = &self.bar_infos[usize::from(index)];
+            let wide = info.bar_value & PCI_CONFIG_MEMORY_BAR_64BIT != 0;
+            if wide && index == NUM_BAR_REGS - 1 {
+                break;
+            }
+            if info.size.is_power_of_two() && info.bar_value & PCI_CONFIG_IO_BAR == 0 {
+                requirements.push(BarRequirement {
+                    slot: BarSlot::Bar(index),
+                    size: info.size,
+                    window: if wide && info.bar_value & PCI_CONFIG_BAR_PREFETCHABLE != 0 {
+                        BarWindow::Mmio64
+                    } else {
+                        BarWindow::Mmio32
+                    },
+                });
+            }
+            index += if wide { 2 } else { 1 };
+        }
+        requirements
+    }
+    pub(crate) fn finish(
+        self,
+        vm: &Arc<KvmVm>,
+        sbdf: PciSBDF,
+        placements: &[(BarSlot, u64)],
+    ) -> Result<VfioDevice, VfioError> {
+        let mut bars = Bars::default();
+        for &(BarSlot::Bar(index), addr) in placements {
+            let info = &self.bar_infos[usize::from(index)];
+            let prefetch = (info.bar_value & PCI_CONFIG_BAR_PREFETCHABLE != 0).into();
+            if info.bar_value & PCI_CONFIG_MEMORY_BAR_64BIT != 0 {
+                bars.set_bar_64(index, addr, info.size, prefetch);
+            } else {
+                bars.set_bar_32(
+                    index,
+                    u32::try_from(addr).map_err(|_| VfioError::BarAllocation)?,
+                    u32::try_from(info.size).map_err(|_| VfioError::BarAllocation)?,
+                    prefetch,
+                );
+            }
+        }
+        vfio_finish_device(self, vm, sbdf, Some(bars))
+    }
 }
 
 /// Each used BAR has exactly one emulated area covering the whole BAR.
@@ -1265,22 +1364,20 @@ fn vfio_init_device(
     config: DevicePassthroughConfig,
     sbdf: PciSBDF,
 ) -> Result<VfioDevice, VfioError> {
-    let sysfs_path = format!(
-        "/sys/bus/pci/devices/{:04x}:{:02x}:{:02x}.{:x}",
-        config.sbdf.segment(),
-        config.sbdf.bus(),
-        config.sbdf.device(),
-        config.sbdf.function()
-    );
-    debug!("Opening device at path: {}", sysfs_path);
+    vfio_finish_device(PreparedVfioDevice::new(container, config)?, vm, sbdf, None)
+}
 
-    let device = InternalVfioDevice::new(
-        Path::new(&sysfs_path),
-        container.clone() as Arc<dyn vfio_ioctls::VfioOps>,
-    )?;
-    vfio_device_reset_command_reg(&device);
-    device.reset();
-
+fn vfio_finish_device(
+    prepared: PreparedVfioDevice,
+    vm: &Arc<KvmVm>,
+    sbdf: PciSBDF,
+    allocated: Option<Bars>,
+) -> Result<VfioDevice, VfioError> {
+    let PreparedVfioDevice {
+        config,
+        device,
+        bar_infos,
+    } = prepared;
     let Some(msix_irq_info) = device.get_irq_info(VFIO_PCI_MSIX_IRQ_INDEX) else {
         return Err(VfioError::NoMsixIrq);
     };
@@ -1318,20 +1415,14 @@ fn vfio_init_device(
     device.enable_msix(fds)?;
 
     // There is no direct access to `regions` in `VfioDevice`, so need to work around this
-    let bar_infos: [VfioBarInfo; NUM_BAR_REGS as usize] = std::array::from_fn(|i| {
-        let bar_offset = PCI_CONFIG_BAR_OFFSET as usize / std::mem::size_of::<u32>() + i;
-        let bar_value = config_space[bar_offset];
-        #[allow(clippy::cast_possible_truncation)]
-        VfioBarInfo {
-            bar_value,
-            flags: device.get_region_flags(i as u32),
-            size: device.get_region_size(i as u32),
-            offset: device.get_region_offset(i as u32),
-            caps: device.get_region_caps(i as u32),
-        }
-    });
-
-    let bars = VfioBars::new(vm.clone(), &bar_infos)?;
+    let bars = match allocated {
+        Some(bars) => VfioBars {
+            guest_bars: bars,
+            vmm_bars: bars,
+            vm: vm.clone(),
+        },
+        None => VfioBars::new(vm.clone(), &bar_infos)?,
+    };
 
     let (areas, emulated_areas) = vfio_calculate_bar_areas(&bars.vmm_bars, &bar_infos, &msix_cap)?;
     if !emulated_areas

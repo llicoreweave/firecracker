@@ -103,6 +103,13 @@ pub enum CustomCpuTemplateOrPath {
 pub struct VmmConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numa: Option<crate::numa::NumaConfig>,
+    /// Explicit segment-zero PCI topology, consumed before boot.
+    #[serde(
+        default,
+        rename = "pci-topology",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pci_topology: Option<crate::vmm_config::pci_topology::PciTopologyConfig>,
     pub balloon: Option<BalloonDeviceConfig>,
     pub drives: Vec<BlockDeviceConfig>,
     pub boot_source: BootSourceConfig,
@@ -133,6 +140,8 @@ pub struct VmmConfig {
 pub struct VmResources {
     /// Explicit cold-boot NUMA configuration.
     pub numa: Option<crate::numa::NumaConfig>,
+    /// Explicit cold-boot PCI graph.
+    pub pci_topology: Option<crate::vmm_config::pci_topology::PciTopologyConfig>,
     /// The vCpu and memory configuration for this microVM.
     pub machine_config: MachineConfig,
     /// The boot source spec (contains both config and builder) for this microVM.
@@ -296,12 +305,13 @@ impl VmResources {
         }
 
         resources.numa = vmm_config.numa;
-        resources.validate_numa().map_err(ResourcesError::Numa)?;
+        resources.pci_topology = vmm_config.pci_topology;
 
         for config in vmm_config.device_passthrough {
             resources.device_passthrough.add(config)?;
         }
 
+        resources.validate_numa().map_err(ResourcesError::Numa)?;
         Ok(resources)
     }
 
@@ -319,8 +329,32 @@ impl VmResources {
                 return Err("NUMA does not support memory hotplug or ballooning".into());
             }
         }
-        if self.enclave.is_some() && self.numa.is_some() {
-            return Err("NUMA requires KVM".into());
+        if self.enclave.is_some()
+            && (self.numa.is_some()
+                || self.pci_topology.is_some()
+                || !self.device_passthrough.configs.is_empty())
+        {
+            return Err("NUMA, static PCI topology and VFIO require KVM".into());
+        }
+        if let Some(topology) = &self.pci_topology {
+            if self.machine_config.pcie_hotplug_ports != 0 {
+                return Err("static PCI topology cannot use hotplug ports".into());
+            }
+            if !cfg!(target_arch = "x86_64") || !self.pci_enabled {
+                return Err("explicit PCI topology requires x86_64 and --enable-pci".into());
+            }
+            crate::devices::pci::static_topology::StaticTopology::new(
+                topology,
+                &self.device_passthrough.configs,
+                self.numa.as_ref().map_or(0, |n| n.nodes.len()),
+            )?;
+        } else if self
+            .device_passthrough
+            .configs
+            .iter()
+            .any(|c| c.pci_address.is_some())
+        {
+            return Err("explicit endpoint addresses require pci-topology".into());
         }
         Ok(())
     }
@@ -788,6 +822,7 @@ impl From<&VmResources> for VmmConfig {
             enclave: resources.enclave.clone(),
             device_passthrough: resources.device_passthrough.configs.clone(),
             numa: resources.numa.clone(),
+            pci_topology: resources.pci_topology.clone(),
         }
     }
 }
@@ -960,6 +995,7 @@ mod tests {
     fn default_vm_resources() -> VmResources {
         VmResources {
             numa: None,
+            pci_topology: None,
             machine_config: MachineConfig::default(),
             boot_source: default_boot_cfg(),
             block: default_blocks(),

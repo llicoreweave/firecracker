@@ -167,6 +167,8 @@ pub enum CreateSnapshotError {
     SerializeMicrovmState(#[from] crate::snapshot::SnapshotError),
     /// Snapshotting a NUMA microVM is not supported
     NumaNotSupported,
+    /// Snapshots do not preserve explicitly configured PCI graphs.
+    PciTopologyNotSupported,
     /// Cannot perform {0} on the snapshot backing file: {1}
     SnapshotBackingFile(&'static str, io::Error),
 }
@@ -182,6 +184,13 @@ pub fn create_snapshot(
 ) -> Result<(), CreateSnapshotError> {
     if vmm.vm.as_kvm().is_some_and(|vm| vm.common.numa.is_some()) {
         return Err(CreateSnapshotError::NumaNotSupported);
+    }
+    if vmm
+        .device_manager
+        .pci_devices()
+        .is_some_and(|pci| pci.topology.is_some())
+    {
+        return Err(CreateSnapshotError::PciTopologyNotSupported);
     }
     vmm.can_snapshot(params.snapshot_type)
         .map_err(CreateSnapshotError::MicrovmState)?;

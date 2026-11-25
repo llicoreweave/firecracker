@@ -302,3 +302,9 @@ The `keyboard` requirement for `SendCtrlAltDel` applies to x86_64, which
 emulates an i8042 keyboard controller. On aarch64 the action instead drives a
 PL061 GPIO power button (exposed to the guest as `gpio-keys`); see
 [actions](api_requests/actions.md#sendctrlaltdel).
+
+## Explicit PCI topology
+
+`PUT /device-passthrough/{id}` keeps its upstream `id` and host `sbdf` fields.
+An optional `pci_address` supplies a guest endpoint address when `pci-topology`
+is configured in the cold-boot file. See [NUMA and PCI topology](pci-numa.md).
